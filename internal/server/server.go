@@ -897,6 +897,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/collab/participants", s.handleCollabParticipants)
 	s.mux.HandleFunc("/api/v1/collab/artifacts", s.handleCollabArtifacts)
 	s.mux.HandleFunc("/api/v1/collab/events", s.handleCollabEvents)
+	s.mux.HandleFunc("/api/v1/collab/update-pr", s.handleCollabUpdatePR)
+	s.mux.HandleFunc("/api/v1/collab/merge-gate", s.handleCollabMergeGate)
 	s.mux.HandleFunc("/api/v1/kb/entries", s.handleKBEntries)
 	s.mux.HandleFunc("/api/v1/kb/sections", s.handleKBSections)
 	s.mux.HandleFunc("/api/v1/kb/entries/history", s.handleKBEntryHistory)
@@ -3597,9 +3599,19 @@ var reminderActionPattern = regexp.MustCompile(`(?i)\[ACTION:([A-Z0-9_+\-]+)\]`)
 type collabProposeRequest struct {
 	Title      string `json:"title"`
 	Goal       string `json:"goal"`
+	Kind       string `json:"kind"`
 	Complexity string `json:"complexity"`
 	MinMembers int    `json:"min_members"`
 	MaxMembers int    `json:"max_members"`
+	PRRepo     string `json:"pr_repo"`
+}
+
+type collabUpdatePRRequest struct {
+	CollabID  string `json:"collab_id"`
+	PRBranch  string `json:"pr_branch"`
+	PRURL     string `json:"pr_url"`
+	PRBaseSHA string `json:"pr_base_sha"`
+	PRHeadSHA string `json:"pr_head_sha"`
 }
 
 type collabApplyRequest struct {
@@ -4504,12 +4516,21 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Title = strings.TrimSpace(req.Title)
 	req.Goal = strings.TrimSpace(req.Goal)
+	req.Kind = strings.TrimSpace(strings.ToLower(req.Kind))
+	if req.Kind == "" {
+		req.Kind = "general"
+	}
 	req.Complexity = strings.TrimSpace(strings.ToLower(req.Complexity))
 	if req.Complexity == "" {
 		req.Complexity = "normal"
 	}
+	req.PRRepo = strings.TrimSpace(req.PRRepo)
 	if req.Title == "" || req.Goal == "" {
 		writeError(w, http.StatusBadRequest, "title and goal are required")
+		return
+	}
+	if req.Kind == "upgrade_pr" && req.PRRepo == "" {
+		writeError(w, http.StatusBadRequest, "pr_repo is required for kind=upgrade_pr")
 		return
 	}
 	if req.MinMembers <= 0 {
@@ -4526,11 +4547,13 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 		CollabID:       generateCollabID(),
 		Title:          req.Title,
 		Goal:           req.Goal,
+		Kind:           req.Kind,
 		Complexity:     req.Complexity,
 		Phase:          "recruiting",
 		ProposerUserID: proposerUserID,
 		MinMembers:     req.MinMembers,
 		MaxMembers:     req.MaxMembers,
+		PRRepo:         req.PRRepo,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -4609,10 +4632,11 @@ func (s *Server) handleCollabList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	kind := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("kind")))
 	phase := normalizeCollabPhase(r.URL.Query().Get("phase"))
 	proposer := strings.TrimSpace(r.URL.Query().Get("proposer_user_id"))
 	limit := parseLimit(r.URL.Query().Get("limit"), 100)
-	items, err := s.store.ListCollabSessions(r.Context(), phase, proposer, limit)
+	items, err := s.store.ListCollabSessions(r.Context(), kind, phase, proposer, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -4679,7 +4703,35 @@ func (s *Server) handleCollabApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.appendCollabEvent(r.Context(), req.CollabID, userID, "participant.applied", map[string]any{"pitch": req.Pitch})
+	s.notifyCollabApply(r.Context(), session, userID)
 	writeJSON(w, http.StatusAccepted, map[string]any{"item": item})
+}
+
+func (s *Server) notifyCollabApply(ctx context.Context, session store.CollabSession, applicantUserID string) {
+	proposer := strings.TrimSpace(session.ProposerUserID)
+	if proposer == "" || isSystemRuntimeUserID(proposer) {
+		return
+	}
+	participants, err := s.store.ListCollabParticipants(ctx, session.CollabID, "", 500)
+	if err != nil {
+		return
+	}
+	appliedCount := 0
+	for _, p := range participants {
+		if strings.EqualFold(p.Status, "applied") || strings.EqualFold(p.Status, "selected") {
+			appliedCount++
+		}
+	}
+	readyNote := ""
+	if appliedCount >= session.MinMembers {
+		readyNote = fmt.Sprintf("\n\nApplicant count (%d) meets min_members (%d). You can now assign roles via POST /api/v1/collab/assign.", appliedCount, session.MinMembers)
+	}
+	subject := fmt.Sprintf("[COLLAB-APPLY] %s applied to %s (%d applicants)", applicantUserID, session.CollabID, appliedCount)
+	body := fmt.Sprintf(
+		"collab_id=%s\napplicant=%s\npitch=%s\napplied_count=%d\nmin_members=%d%s",
+		session.CollabID, applicantUserID, "", appliedCount, session.MinMembers, readyNote,
+	)
+	s.sendMailAndPushHint(ctx, clawWorldSystemID, []string{proposer}, subject, body)
 }
 
 func (s *Server) handleCollabAssign(w http.ResponseWriter, r *http.Request) {
@@ -5038,6 +5090,125 @@ func (s *Server) handleCollabEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleCollabUpdatePR(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	userID, err := s.authenticatedUserIDOrAPIKey(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	var req collabUpdatePRRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.CollabID = strings.TrimSpace(req.CollabID)
+	if req.CollabID == "" {
+		writeError(w, http.StatusBadRequest, "collab_id is required")
+		return
+	}
+	session, err := s.store.GetCollabSession(r.Context(), req.CollabID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if session.Kind != "upgrade_pr" {
+		writeError(w, http.StatusBadRequest, "update-pr is only valid for kind=upgrade_pr collabs")
+		return
+	}
+	allowed := userID == session.ProposerUserID || userID == session.OrchestratorUserID
+	if !allowed {
+		participants, _ := s.store.ListCollabParticipants(r.Context(), req.CollabID, "selected", 500)
+		for _, p := range participants {
+			if p.UserID == userID && (p.Role == "author" || p.Role == "orchestrator") {
+				allowed = true
+				break
+			}
+		}
+	}
+	if !allowed {
+		writeError(w, http.StatusForbidden, "only proposer, orchestrator, or author can update PR metadata")
+		return
+	}
+	updated, err := s.store.UpdateCollabPR(r.Context(), req.CollabID,
+		strings.TrimSpace(req.PRBranch), strings.TrimSpace(req.PRURL),
+		strings.TrimSpace(req.PRBaseSHA), strings.TrimSpace(req.PRHeadSHA))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.appendCollabEvent(r.Context(), req.CollabID, userID, "pr.updated", map[string]any{
+		"pr_url":      updated.PRURL,
+		"pr_branch":   updated.PRBranch,
+		"pr_head_sha": updated.PRHeadSHA,
+		"pr_base_sha": updated.PRBaseSHA,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"item": updated})
+}
+
+func (s *Server) handleCollabMergeGate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	collabID := strings.TrimSpace(r.URL.Query().Get("collab_id"))
+	if collabID == "" {
+		writeError(w, http.StatusBadRequest, "collab_id is required")
+		return
+	}
+	session, err := s.store.GetCollabSession(r.Context(), collabID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if session.Kind != "upgrade_pr" {
+		writeError(w, http.StatusBadRequest, "merge-gate is only valid for kind=upgrade_pr collabs")
+		return
+	}
+	artifacts, err := s.store.ListCollabArtifacts(r.Context(), collabID, "", 500)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	approvals := 0
+	approvalsAtHead := 0
+	staleVerdicts := 0
+	for _, a := range artifacts {
+		if !strings.EqualFold(a.Kind, "review_verdict") {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(a.Summary), "approve") && !strings.Contains(strings.ToLower(a.Content), "verdict=approve") {
+			continue
+		}
+		approvals++
+		if session.PRHeadSHA != "" && strings.Contains(a.Content, session.PRHeadSHA) {
+			approvalsAtHead++
+		} else {
+			staleVerdicts++
+		}
+	}
+	blockers := make([]string, 0)
+	if approvalsAtHead < 2 {
+		blockers = append(blockers, fmt.Sprintf("need 2 approvals at current head_sha, have %d", approvalsAtHead))
+	}
+	mergeable := approvalsAtHead >= 2
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"collab_id":         session.CollabID,
+		"pr_url":            session.PRURL,
+		"pr_head_sha":       session.PRHeadSHA,
+		"approvals":         approvals,
+		"approvals_at_head": approvalsAtHead,
+		"stale_verdicts":    staleVerdicts,
+		"tests_passed":      "unknown",
+		"mergeable":         mergeable,
+		"blockers":          blockers,
+	})
 }
 
 func normalizeKBProposalStatus(v string) string {
@@ -6821,7 +6992,7 @@ func (s *Server) apiCatalog() []string {
 		"GET /api/v1/ganglia/ratings?ganglion_id=<id>&limit=<n>",
 		"GET /api/v1/ganglia/protocol",
 		"POST /api/v1/collab/propose",
-		"GET /api/v1/collab/list?phase=<phase>&proposer_user_id=<id>&limit=<n>",
+		"GET /api/v1/collab/list?kind=<kind>&phase=<phase>&proposer_user_id=<id>&limit=<n>",
 		"GET /api/v1/collab/get?collab_id=<id>",
 		"POST /api/v1/collab/apply",
 		"POST /api/v1/collab/assign",
@@ -6832,6 +7003,8 @@ func (s *Server) apiCatalog() []string {
 		"GET /api/v1/collab/participants?collab_id=<id>&status=<status>&limit=<n>",
 		"GET /api/v1/collab/artifacts?collab_id=<id>&user_id=<id>&limit=<n>",
 		"GET /api/v1/collab/events?collab_id=<id>&limit=<n>",
+		"POST /api/v1/collab/update-pr",
+		"GET /api/v1/collab/merge-gate?collab_id=<id>",
 		"GET /api/v1/ops/product-overview?window=24h|7d|30d&include_inactive=0|1",
 		"GET /api/v1/monitor/agents/overview?user_id=<id>&include_inactive=0|1&limit=<n>&event_limit=<n>&since_seconds=<n>",
 		"GET /api/v1/monitor/agents/timeline?user_id=<id>&limit=<n>&event_limit=<n>&cursor=<n>&since_seconds=<n>",
@@ -7398,7 +7571,8 @@ func isSharedWritePath(method, path string) bool {
 		"/api/v1/collab/start",
 		"/api/v1/collab/submit",
 		"/api/v1/collab/review",
-		"/api/v1/collab/close":
+		"/api/v1/collab/close",
+		"/api/v1/collab/update-pr":
 		return true
 
 	// Content/protocol production

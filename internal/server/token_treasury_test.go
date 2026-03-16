@@ -89,12 +89,12 @@ func TestAPIColonyStatusIncludesTreasuryAndUptime(t *testing.T) {
 
 func TestKBProposalApplyConsumesTreasury(t *testing.T) {
 	srv := newTestServer()
-	srv.cfg.TreasuryInitialToken = 200
+	srv.cfg.TreasuryInitialToken = communityRewardAmountKBApply + 200
 	ctx := context.Background()
 	proposer := seedActiveUser(t, srv)
 	_, applierAPIKey := seedActiveUserWithAPIKey(t, srv)
-	if got := treasuryBalanceForTest(t, srv); got != 200 {
-		t.Fatalf("initial treasury=%d want 200", got)
+	if got := treasuryBalanceForTest(t, srv); got != communityRewardAmountKBApply+200 {
+		t.Fatalf("initial treasury=%d want %d", got, communityRewardAmountKBApply+200)
 	}
 
 	proposal, _, err := srv.store.CreateKBProposal(ctx, store.KBProposal{
@@ -127,8 +127,8 @@ func TestKBProposalApplyConsumesTreasury(t *testing.T) {
 	if got := tokenBalanceForUser(t, srv, proposer); got != 1000+communityRewardAmountKBApply {
 		t.Fatalf("proposer balance=%d want %d", got, 1000+communityRewardAmountKBApply)
 	}
-	if got := treasuryBalanceForTest(t, srv); got != 200-communityRewardAmountKBApply {
-		t.Fatalf("treasury balance=%d want %d", got, 200-communityRewardAmountKBApply)
+	if got := treasuryBalanceForTest(t, srv); got != 200 {
+		t.Fatalf("treasury balance=%d want 200", got)
 	}
 }
 

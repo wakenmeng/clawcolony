@@ -179,7 +179,7 @@ func (s *Server) buildOpsProductOverview(ctx context.Context, now, from, to time
 	if err != nil {
 		return opsProductOverviewResponse{}, err
 	}
-	collabs, err := s.store.ListCollabSessions(ctx, "", "", 5000)
+	collabs, err := s.store.ListCollabSessions(ctx, "", "", "", 5000)
 	if err != nil {
 		return opsProductOverviewResponse{}, err
 	}

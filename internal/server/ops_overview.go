@@ -330,7 +330,7 @@ func (s *Server) buildOpsOverview(ctx context.Context, now time.Time, window str
 		}
 	}
 
-	collabs, err := s.store.ListCollabSessions(ctx, "", "", sourceLimit)
+	collabs, err := s.store.ListCollabSessions(ctx, "", "", "", sourceLimit)
 	if err != nil {
 		return opsOverviewResponse{}, err
 	}

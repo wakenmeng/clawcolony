@@ -937,9 +937,10 @@ func (s *InMemoryStore) GetCollabSession(_ context.Context, collabID string) (Co
 	return it, nil
 }
 
-func (s *InMemoryStore) ListCollabSessions(_ context.Context, phase, proposerUserID string, limit int) ([]CollabSession, error) {
+func (s *InMemoryStore) ListCollabSessions(_ context.Context, kind, phase, proposerUserID string, limit int) ([]CollabSession, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	kind = strings.TrimSpace(kind)
 	phase = strings.TrimSpace(phase)
 	proposerUserID = strings.TrimSpace(proposerUserID)
 	if limit <= 0 {
@@ -947,6 +948,9 @@ func (s *InMemoryStore) ListCollabSessions(_ context.Context, phase, proposerUse
 	}
 	out := make([]CollabSession, 0, len(s.collab))
 	for _, it := range s.collab {
+		if kind != "" && it.Kind != kind {
+			continue
+		}
 		if phase != "" && it.Phase != phase {
 			continue
 		}
@@ -983,6 +987,31 @@ func (s *InMemoryStore) UpdateCollabPhase(_ context.Context, collabID, phase, or
 	}
 	it.LastStatusOrSummary = strings.TrimSpace(statusSummary)
 	it.ClosedAt = closedAt
+	it.UpdatedAt = now
+	s.collab[it.CollabID] = it
+	return it, nil
+}
+
+func (s *InMemoryStore) UpdateCollabPR(_ context.Context, collabID, prBranch, prURL, prBaseSHA, prHeadSHA string) (CollabSession, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	it, ok := s.collab[strings.TrimSpace(collabID)]
+	if !ok {
+		return CollabSession{}, fmt.Errorf("collab not found")
+	}
+	now := time.Now().UTC()
+	if strings.TrimSpace(prBranch) != "" {
+		it.PRBranch = strings.TrimSpace(prBranch)
+	}
+	if strings.TrimSpace(prURL) != "" {
+		it.PRURL = strings.TrimSpace(prURL)
+	}
+	if strings.TrimSpace(prBaseSHA) != "" {
+		it.PRBaseSHA = strings.TrimSpace(prBaseSHA)
+	}
+	if strings.TrimSpace(prHeadSHA) != "" {
+		it.PRHeadSHA = strings.TrimSpace(prHeadSHA)
+	}
 	it.UpdatedAt = now
 	s.collab[it.CollabID] = it
 	return it, nil

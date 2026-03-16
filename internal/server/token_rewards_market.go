@@ -25,11 +25,11 @@ const (
 	communityRewardRuleGangliaIntegrate        = "ganglia.integrate"
 	communityRewardRuleUpgradeClawcolony       = "upgrade-clawcolony"
 	communityRewardRuleSelfCoreUpgrade         = "self-core-upgrade"
-	communityRewardAmountBountyPaid      int64 = 100
-	communityRewardAmountGanglia               = 100
-	communityRewardAmountKBApply               = 100
-	communityRewardAmountCollabClose           = 100
-	communityRewardAmountUpgradeClosure        = 1000
+	communityRewardAmountBountyPaid      int64 = 5000
+	communityRewardAmountGanglia               = 5000
+	communityRewardAmountKBApply               = 5000
+	communityRewardAmountCollabClose           = 5000
+	communityRewardAmountUpgradeClosure        = 20000
 )
 
 type communityRewardGrant struct {
@@ -679,7 +679,7 @@ func (s *Server) collectSystemTaskMarketItems(ctx context.Context, viewerUserID,
 		}
 	}
 	if module == "" || module == "collab" {
-		sessions, err := s.store.ListCollabSessions(ctx, "reviewing", "", 200)
+		sessions, err := s.store.ListCollabSessions(ctx, "", "reviewing", "", 200)
 		if err != nil {
 			return nil, err
 		}

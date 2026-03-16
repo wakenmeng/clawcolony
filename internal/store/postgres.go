@@ -292,12 +292,18 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			collab_id TEXT PRIMARY KEY,
 			title TEXT NOT NULL,
 			goal TEXT NOT NULL,
+			kind TEXT NOT NULL DEFAULT 'general',
 			complexity TEXT NOT NULL DEFAULT 'normal',
 			phase TEXT NOT NULL,
 			proposer_user_id TEXT NOT NULL,
 			orchestrator_user_id TEXT NOT NULL DEFAULT '',
 			min_members INT NOT NULL DEFAULT 2,
 			max_members INT NOT NULL DEFAULT 3,
+			pr_repo TEXT NOT NULL DEFAULT '',
+			pr_branch TEXT NOT NULL DEFAULT '',
+			pr_url TEXT NOT NULL DEFAULT '',
+			pr_base_sha TEXT NOT NULL DEFAULT '',
+			pr_head_sha TEXT NOT NULL DEFAULT '',
 			status_summary TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -305,6 +311,7 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_collab_sessions_phase_updated ON collab_sessions(phase, updated_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_collab_sessions_proposer_updated ON collab_sessions(proposer_user_id, updated_at DESC)`,
+		// idx_collab_sessions_kind created below, after ALTER TABLE adds kind column
 		`CREATE TABLE IF NOT EXISTS collab_participants (
 			id BIGSERIAL PRIMARY KEY,
 			collab_id TEXT NOT NULL REFERENCES collab_sessions(collab_id) ON DELETE CASCADE,
@@ -340,6 +347,14 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_collab_events_collab_id ON collab_events(collab_id, id DESC)`,
+		// collab_sessions PR collaboration fields (multi-agent PR collab P0)
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'general'`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_repo TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_branch TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_base_sha TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_head_sha TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_collab_sessions_kind ON collab_sessions(kind, phase, updated_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS kb_entries (
 			id BIGSERIAL PRIMARY KEY,
 			section TEXT NOT NULL DEFAULT '',
@@ -1707,15 +1722,21 @@ func (s *PostgresStore) CreateCollabSession(ctx context.Context, item CollabSess
 	}
 	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO collab_sessions(
-			collab_id, title, goal, complexity, phase, proposer_user_id,
-			orchestrator_user_id, min_members, max_members, status_summary, created_at, updated_at, closed_at
+			collab_id, title, goal, kind, complexity, phase, proposer_user_id,
+			orchestrator_user_id, min_members, max_members,
+			pr_repo, pr_branch, pr_url, pr_base_sha, pr_head_sha,
+			status_summary, created_at, updated_at, closed_at
 		)
-		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW(), $11)
-		RETURNING collab_id, title, goal, complexity, phase, proposer_user_id, orchestrator_user_id,
-			min_members, max_members, status_summary, created_at, updated_at, closed_at
-	`, item.CollabID, item.Title, item.Goal, item.Complexity, item.Phase, item.ProposerUserID, item.OrchestratorUserID, item.MinMembers, item.MaxMembers, item.LastStatusOrSummary, item.ClosedAt).Scan(
-		&item.CollabID, &item.Title, &item.Goal, &item.Complexity, &item.Phase, &item.ProposerUserID, &item.OrchestratorUserID,
-		&item.MinMembers, &item.MaxMembers, &item.LastStatusOrSummary, &item.CreatedAt, &item.UpdatedAt, &item.ClosedAt,
+		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW(), NOW(), $17)
+		RETURNING collab_id, title, goal, kind, complexity, phase, proposer_user_id, orchestrator_user_id,
+			min_members, max_members, pr_repo, pr_branch, pr_url, pr_base_sha, pr_head_sha,
+			status_summary, created_at, updated_at, closed_at
+	`, item.CollabID, item.Title, item.Goal, item.Kind, item.Complexity, item.Phase, item.ProposerUserID, item.OrchestratorUserID,
+		item.MinMembers, item.MaxMembers, item.PRRepo, item.PRBranch, item.PRURL, item.PRBaseSHA, item.PRHeadSHA,
+		item.LastStatusOrSummary, item.ClosedAt).Scan(
+		&item.CollabID, &item.Title, &item.Goal, &item.Kind, &item.Complexity, &item.Phase, &item.ProposerUserID, &item.OrchestratorUserID,
+		&item.MinMembers, &item.MaxMembers, &item.PRRepo, &item.PRBranch, &item.PRURL, &item.PRBaseSHA, &item.PRHeadSHA,
+		&item.LastStatusOrSummary, &item.CreatedAt, &item.UpdatedAt, &item.ClosedAt,
 	)
 	if err != nil {
 		return CollabSession{}, err
@@ -1727,12 +1748,14 @@ func (s *PostgresStore) GetCollabSession(ctx context.Context, collabID string) (
 	var item CollabSession
 	var closed sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
-		SELECT collab_id, title, goal, complexity, phase, proposer_user_id, orchestrator_user_id,
-			min_members, max_members, status_summary, created_at, updated_at, closed_at
+		SELECT collab_id, title, goal, kind, complexity, phase, proposer_user_id, orchestrator_user_id,
+			min_members, max_members, pr_repo, pr_branch, pr_url, pr_base_sha, pr_head_sha,
+			status_summary, created_at, updated_at, closed_at
 		FROM collab_sessions WHERE collab_id = $1
 	`, strings.TrimSpace(collabID)).Scan(
-		&item.CollabID, &item.Title, &item.Goal, &item.Complexity, &item.Phase, &item.ProposerUserID, &item.OrchestratorUserID,
-		&item.MinMembers, &item.MaxMembers, &item.LastStatusOrSummary, &item.CreatedAt, &item.UpdatedAt, &closed,
+		&item.CollabID, &item.Title, &item.Goal, &item.Kind, &item.Complexity, &item.Phase, &item.ProposerUserID, &item.OrchestratorUserID,
+		&item.MinMembers, &item.MaxMembers, &item.PRRepo, &item.PRBranch, &item.PRURL, &item.PRBaseSHA, &item.PRHeadSHA,
+		&item.LastStatusOrSummary, &item.CreatedAt, &item.UpdatedAt, &closed,
 	)
 	if err != nil {
 		return CollabSession{}, err
@@ -1743,7 +1766,7 @@ func (s *PostgresStore) GetCollabSession(ctx context.Context, collabID string) (
 	return item, nil
 }
 
-func (s *PostgresStore) ListCollabSessions(ctx context.Context, phase, proposerUserID string, limit int) ([]CollabSession, error) {
+func (s *PostgresStore) ListCollabSessions(ctx context.Context, kind, phase, proposerUserID string, limit int) ([]CollabSession, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -1751,14 +1774,16 @@ func (s *PostgresStore) ListCollabSessions(ctx context.Context, phase, proposerU
 		limit = 500
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT collab_id, title, goal, complexity, phase, proposer_user_id, orchestrator_user_id,
-			min_members, max_members, status_summary, created_at, updated_at, closed_at
+		SELECT collab_id, title, goal, kind, complexity, phase, proposer_user_id, orchestrator_user_id,
+			min_members, max_members, pr_repo, pr_branch, pr_url, pr_base_sha, pr_head_sha,
+			status_summary, created_at, updated_at, closed_at
 		FROM collab_sessions
-		WHERE ($1 = '' OR phase = $1)
-		  AND ($2 = '' OR proposer_user_id = $2)
+		WHERE ($1 = '' OR kind = $1)
+		  AND ($2 = '' OR phase = $2)
+		  AND ($3 = '' OR proposer_user_id = $3)
 		ORDER BY updated_at DESC, collab_id DESC
-		LIMIT $3
-	`, strings.TrimSpace(phase), strings.TrimSpace(proposerUserID), limit)
+		LIMIT $4
+	`, strings.TrimSpace(kind), strings.TrimSpace(phase), strings.TrimSpace(proposerUserID), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1768,8 +1793,9 @@ func (s *PostgresStore) ListCollabSessions(ctx context.Context, phase, proposerU
 		var it CollabSession
 		var closed sql.NullTime
 		if err := rows.Scan(
-			&it.CollabID, &it.Title, &it.Goal, &it.Complexity, &it.Phase, &it.ProposerUserID, &it.OrchestratorUserID,
-			&it.MinMembers, &it.MaxMembers, &it.LastStatusOrSummary, &it.CreatedAt, &it.UpdatedAt, &closed,
+			&it.CollabID, &it.Title, &it.Goal, &it.Kind, &it.Complexity, &it.Phase, &it.ProposerUserID, &it.OrchestratorUserID,
+			&it.MinMembers, &it.MaxMembers, &it.PRRepo, &it.PRBranch, &it.PRURL, &it.PRBaseSHA, &it.PRHeadSHA,
+			&it.LastStatusOrSummary, &it.CreatedAt, &it.UpdatedAt, &closed,
 		); err != nil {
 			return nil, err
 		}
@@ -1792,11 +1818,41 @@ func (s *PostgresStore) UpdateCollabPhase(ctx context.Context, collabID, phase, 
 			closed_at = $5,
 			updated_at = NOW()
 		WHERE collab_id = $1
-		RETURNING collab_id, title, goal, complexity, phase, proposer_user_id, orchestrator_user_id,
-			min_members, max_members, status_summary, created_at, updated_at, closed_at
+		RETURNING collab_id, title, goal, kind, complexity, phase, proposer_user_id, orchestrator_user_id,
+			min_members, max_members, pr_repo, pr_branch, pr_url, pr_base_sha, pr_head_sha,
+			status_summary, created_at, updated_at, closed_at
 	`, strings.TrimSpace(collabID), strings.TrimSpace(phase), strings.TrimSpace(orchestratorUserID), strings.TrimSpace(statusSummary), closedAt).Scan(
-		&item.CollabID, &item.Title, &item.Goal, &item.Complexity, &item.Phase, &item.ProposerUserID, &item.OrchestratorUserID,
-		&item.MinMembers, &item.MaxMembers, &item.LastStatusOrSummary, &item.CreatedAt, &item.UpdatedAt, &closed,
+		&item.CollabID, &item.Title, &item.Goal, &item.Kind, &item.Complexity, &item.Phase, &item.ProposerUserID, &item.OrchestratorUserID,
+		&item.MinMembers, &item.MaxMembers, &item.PRRepo, &item.PRBranch, &item.PRURL, &item.PRBaseSHA, &item.PRHeadSHA,
+		&item.LastStatusOrSummary, &item.CreatedAt, &item.UpdatedAt, &closed,
+	)
+	if err != nil {
+		return CollabSession{}, err
+	}
+	if closed.Valid {
+		item.ClosedAt = &closed.Time
+	}
+	return item, nil
+}
+
+func (s *PostgresStore) UpdateCollabPR(ctx context.Context, collabID, prBranch, prURL, prBaseSHA, prHeadSHA string) (CollabSession, error) {
+	var item CollabSession
+	var closed sql.NullTime
+	err := s.db.QueryRowContext(ctx, `
+		UPDATE collab_sessions
+		SET pr_branch = CASE WHEN $2 = '' THEN pr_branch ELSE $2 END,
+			pr_url = CASE WHEN $3 = '' THEN pr_url ELSE $3 END,
+			pr_base_sha = CASE WHEN $4 = '' THEN pr_base_sha ELSE $4 END,
+			pr_head_sha = CASE WHEN $5 = '' THEN pr_head_sha ELSE $5 END,
+			updated_at = NOW()
+		WHERE collab_id = $1
+		RETURNING collab_id, title, goal, kind, complexity, phase, proposer_user_id, orchestrator_user_id,
+			min_members, max_members, pr_repo, pr_branch, pr_url, pr_base_sha, pr_head_sha,
+			status_summary, created_at, updated_at, closed_at
+	`, strings.TrimSpace(collabID), strings.TrimSpace(prBranch), strings.TrimSpace(prURL), strings.TrimSpace(prBaseSHA), strings.TrimSpace(prHeadSHA)).Scan(
+		&item.CollabID, &item.Title, &item.Goal, &item.Kind, &item.Complexity, &item.Phase, &item.ProposerUserID, &item.OrchestratorUserID,
+		&item.MinMembers, &item.MaxMembers, &item.PRRepo, &item.PRBranch, &item.PRURL, &item.PRBaseSHA, &item.PRHeadSHA,
+		&item.LastStatusOrSummary, &item.CreatedAt, &item.UpdatedAt, &closed,
 	)
 	if err != nil {
 		return CollabSession{}, err

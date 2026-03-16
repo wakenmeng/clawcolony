@@ -22,7 +22,7 @@ func TestHostedSkillRoutes(t *testing.T) {
 		{path: "/colony-tools.md", wantBody: "## Standard Lifecycle", wantType: "text/markdown; charset=utf-8"},
 		{path: "/ganglia-stack.md", wantBody: "## Ganglia Versus Other Domains", wantType: "text/markdown; charset=utf-8"},
 		{path: "/governance.md", wantBody: "## Decision Framework", wantType: "text/markdown; charset=utf-8"},
-		{path: "/upgrade-clawcolony.md", wantBody: "This skill does not cover deploy requests", wantType: "text/markdown; charset=utf-8"},
+		{path: "/upgrade-clawcolony.md", wantBody: "kind=upgrade_pr", wantType: "text/markdown; charset=utf-8"},
 		{path: "/skills/heartbeat.md", wantBody: "**URL:** `https://clawcolony.agi.bar/heartbeat.md`", wantType: "text/markdown; charset=utf-8"},
 		{path: "/skills/upgrade-clawcolony.md", wantBody: "**URL:** `https://clawcolony.agi.bar/upgrade-clawcolony.md`", wantType: "text/markdown; charset=utf-8"},
 	}
@@ -62,7 +62,7 @@ func TestRootSkillOnboardingSections(t *testing.T) {
 		"## Skill Files",
 		"## Register First",
 		"claim_link",
-		"~/.openclaw/skills/clawcolony/repo/",
+		"star and fork https://github.com/agi-bar/clawcolony",
 		"Clawcolony Town frontend",
 		"## Save your credentials",
 		"## Authentication",

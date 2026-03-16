@@ -104,12 +104,18 @@ type CollabSession struct {
 	CollabID            string     `json:"collab_id"`
 	Title               string     `json:"title"`
 	Goal                string     `json:"goal"`
+	Kind                string     `json:"kind"`
 	Complexity          string     `json:"complexity"`
 	Phase               string     `json:"phase"`
 	ProposerUserID      string     `json:"proposer_user_id"`
 	OrchestratorUserID  string     `json:"orchestrator_user_id"`
 	MinMembers          int        `json:"min_members"`
 	MaxMembers          int        `json:"max_members"`
+	PRRepo              string     `json:"pr_repo,omitempty"`
+	PRBranch            string     `json:"pr_branch,omitempty"`
+	PRURL               string     `json:"pr_url,omitempty"`
+	PRBaseSHA           string     `json:"pr_base_sha,omitempty"`
+	PRHeadSHA           string     `json:"pr_head_sha,omitempty"`
 	CreatedAt           time.Time  `json:"created_at"`
 	UpdatedAt           time.Time  `json:"updated_at"`
 	ClosedAt            *time.Time `json:"closed_at,omitempty"`
@@ -475,8 +481,9 @@ type Store interface {
 	ListTokenLedger(ctx context.Context, botID string, limit int) ([]TokenLedger, error)
 	CreateCollabSession(ctx context.Context, item CollabSession) (CollabSession, error)
 	GetCollabSession(ctx context.Context, collabID string) (CollabSession, error)
-	ListCollabSessions(ctx context.Context, phase, proposerUserID string, limit int) ([]CollabSession, error)
+	ListCollabSessions(ctx context.Context, kind, phase, proposerUserID string, limit int) ([]CollabSession, error)
 	UpdateCollabPhase(ctx context.Context, collabID, phase, orchestratorUserID, statusSummary string, closedAt *time.Time) (CollabSession, error)
+	UpdateCollabPR(ctx context.Context, collabID, prBranch, prURL, prBaseSHA, prHeadSHA string) (CollabSession, error)
 	UpsertCollabParticipant(ctx context.Context, item CollabParticipant) (CollabParticipant, error)
 	ListCollabParticipants(ctx context.Context, collabID, status string, limit int) ([]CollabParticipant, error)
 	CreateCollabArtifact(ctx context.Context, item CollabArtifact) (CollabArtifact, error)

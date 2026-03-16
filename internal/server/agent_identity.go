@@ -445,18 +445,26 @@ func (s *Server) ownerAndPricingMiddleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		session, err := s.requireOwnerSessionForOwner(r, binding.OwnerID)
-		if err != nil {
-			status := http.StatusUnauthorized
-			if errors.Is(err, errOwnerForbidden) {
-				status = http.StatusForbidden
+		authUserID := strings.TrimSpace(AuthenticatedUserID(r))
+		if authUserID != "" {
+			if authUserID != actorUserID {
+				writeError(w, http.StatusForbidden, "api_key does not match actor user_id")
+				return
 			}
-			writeError(w, status, err.Error())
-			return
-		}
-		if _, err := s.store.TouchHumanOwnerSession(r.Context(), session.SessionID, time.Now().UTC()); err != nil && !errors.Is(err, store.ErrHumanOwnerSessionNotFound) {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
+		} else {
+			session, err := s.requireOwnerSessionForOwner(r, binding.OwnerID)
+			if err != nil {
+				status := http.StatusUnauthorized
+				if errors.Is(err, errOwnerForbidden) {
+					status = http.StatusForbidden
+				}
+				writeError(w, status, err.Error())
+				return
+			}
+			if _, err := s.store.TouchHumanOwnerSession(r.Context(), session.SessionID, time.Now().UTC()); err != nil && !errors.Is(err, store.ErrHumanOwnerSessionNotFound) {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
 		}
 		ledger, chargeErr := s.store.Consume(r.Context(), actorUserID, rule.Tokens)
 		if chargeErr != nil {

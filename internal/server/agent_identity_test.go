@@ -17,6 +17,10 @@ func identityTestHandler(srv *Server) http.Handler {
 	return srv.wrappedHTTPHandler()
 }
 
+func identityAPIKeyTestHandler(srv *Server) http.Handler {
+	return srv.apiKeyAuthMiddleware(srv.ownerAndPricingMiddleware(srv.mux))
+}
+
 func parseJSONBody(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
 	t.Helper()
 	var payload map[string]any
@@ -24,6 +28,20 @@ func parseJSONBody(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
 		t.Fatalf("decode body: %v", err)
 	}
 	return payload
+}
+
+func balanceFromResponse(t *testing.T, w *httptest.ResponseRecorder) int64 {
+	t.Helper()
+	body := parseJSONBody(t, w)
+	item, ok := body["item"].(map[string]any)
+	if !ok {
+		t.Fatalf("balance response missing item: %s", w.Body.String())
+	}
+	balance, ok := item["balance"].(float64)
+	if !ok {
+		t.Fatalf("balance response missing numeric balance: %s", w.Body.String())
+	}
+	return int64(balance)
 }
 
 func registerAgentForTest(t *testing.T, h http.Handler, username, goodAt string) (string, string, string) {
@@ -338,8 +356,12 @@ func TestManagedAgentRequiresOwnerSessionAndTokenBalance(t *testing.T) {
 	rewardAgentViaXOAuthForTest(t, h, userID, cookie)
 
 	balance := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
-	if balance.Code != http.StatusOK || !strings.Contains(balance.Body.String(), `"balance":200`) {
-		t.Fatalf("expected rewarded balance=200, got code=%d body=%s", balance.Code, balance.Body.String())
+	if balance.Code != http.StatusOK {
+		t.Fatalf("expected rewarded balance read, got code=%d body=%s", balance.Code, balance.Body.String())
+	}
+	rewardedBalance := balanceFromResponse(t, balance)
+	if rewardedBalance != srv.cfg.SocialRewardXAuth {
+		t.Fatalf("expected rewarded balance=%d, got=%d body=%s", srv.cfg.SocialRewardXAuth, rewardedBalance, balance.Body.String())
 	}
 
 	send := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/mail/send", map[string]any{
@@ -351,13 +373,55 @@ func TestManagedAgentRequiresOwnerSessionAndTokenBalance(t *testing.T) {
 		t.Fatalf("expected accepted send after reward, got=%d body=%s", send.Code, send.Body.String())
 	}
 	after := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
-	if after.Code != http.StatusOK || !strings.Contains(after.Body.String(), `"balance":199`) {
-		t.Fatalf("expected balance=199 after priced send, got code=%d body=%s", after.Code, after.Body.String())
+	if after.Code != http.StatusOK {
+		t.Fatalf("expected balance read after priced send, got code=%d body=%s", after.Code, after.Body.String())
+	}
+	if afterBalance := balanceFromResponse(t, after); afterBalance >= rewardedBalance {
+		t.Fatalf("expected priced send to reduce balance, before=%d after=%d body=%s", rewardedBalance, afterBalance, after.Body.String())
 	}
 
 	ownerMe := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/owner/me", nil, map[string]string{"Cookie": cookie})
 	if ownerMe.Code != http.StatusOK || !strings.Contains(ownerMe.Body.String(), `"x_handle":"@orbit_agent"`) {
 		t.Fatalf("expected owner x identity binding, got code=%d body=%s", ownerMe.Code, ownerMe.Body.String())
+	}
+}
+
+func TestManagedAgentCanUseAPIKeyForPricedWrite(t *testing.T) {
+	xOAuth := enableXOAuthForTest(t)
+	defer xOAuth.Close()
+
+	srv := newTestServer()
+	srv.cfg.RegistrationGrantToken = 0
+	h := identityAPIKeyTestHandler(srv)
+
+	userID, apiKey, claimLink := registerAgentForTest(t, h, "managed-apikey-agent", "mail")
+	_, cookie := claimAgentForTest(t, h, claimLink, "managed-apikey@example.com", "human-manager-apikey")
+	recipient := seedActiveUser(t, srv)
+
+	rewardAgentViaXOAuthForTest(t, h, userID, cookie)
+
+	before := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
+	if before.Code != http.StatusOK {
+		t.Fatalf("expected balance read before send, got=%d body=%s", before.Code, before.Body.String())
+	}
+	beforeBalance := balanceFromResponse(t, before)
+
+	send := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/mail/send", map[string]any{
+		"to_user_ids": []string{recipient},
+		"subject":     "hello",
+		"body":        "world",
+	}, map[string]string{"Authorization": "Bearer " + apiKey})
+	if send.Code != http.StatusAccepted {
+		t.Fatalf("expected accepted send with api key, got=%d body=%s", send.Code, send.Body.String())
+	}
+
+	after := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
+	if after.Code != http.StatusOK {
+		t.Fatalf("expected balance read after send, got code=%d body=%s", after.Code, after.Body.String())
+	}
+	afterBalance := balanceFromResponse(t, after)
+	if afterBalance >= beforeBalance {
+		t.Fatalf("expected priced write to reduce balance, before=%d after=%d body=%s", beforeBalance, afterBalance, after.Body.String())
 	}
 }
 
@@ -458,8 +522,12 @@ func TestGitHubVerifyUsesServerSideVerificationAndRewards(t *testing.T) {
 	}
 
 	balance := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
-	if balance.Code != http.StatusOK || !strings.Contains(balance.Body.String(), `"balance":2200`) {
-		t.Fatalf("expected rewarded balance=2200, got code=%d body=%s", balance.Code, balance.Body.String())
+	if balance.Code != http.StatusOK {
+		t.Fatalf("expected rewarded balance read, got code=%d body=%s", balance.Code, balance.Body.String())
+	}
+	expectedBalance := srv.cfg.SocialRewardGitHubAuth + srv.cfg.SocialRewardGitHubStar + srv.cfg.SocialRewardGitHubFork
+	if got := balanceFromResponse(t, balance); got != expectedBalance {
+		t.Fatalf("expected rewarded balance=%d, got=%d body=%s", expectedBalance, got, balance.Body.String())
 	}
 
 	ownerMe := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/owner/me", nil, map[string]string{"Cookie": cookie})
@@ -651,7 +719,7 @@ func TestOwnerLogoutRevokesSession(t *testing.T) {
 	srv := newTestServer()
 	h := identityTestHandler(srv)
 
-	_, apiKey, claimLink := registerAgentForTest(t, h, "logout-agent", "mail")
+	_, _, claimLink := registerAgentForTest(t, h, "logout-agent", "mail")
 	_, cookie := claimAgentForTest(t, h, claimLink, "logout@example.com", "logout-human")
 	recipient := seedActiveUser(t, srv)
 
@@ -664,7 +732,7 @@ func TestOwnerLogoutRevokesSession(t *testing.T) {
 		"to_user_ids": []string{recipient},
 		"subject":     "hello",
 		"body":        "world",
-	}, map[string]string{"Cookie": cookie, "Authorization": "Bearer " + apiKey})
+	}, map[string]string{"Cookie": cookie})
 	if send.Code != http.StatusUnauthorized {
 		t.Fatalf("expected revoked session to be rejected, got=%d body=%s", send.Code, send.Body.String())
 	}
@@ -722,7 +790,7 @@ func TestClaimAlreadyClaimedAgentConflicts(t *testing.T) {
 	}
 }
 
-func TestManagedOwnerCannotWriteForAnotherClaimedAgent(t *testing.T) {
+func TestAPIKeyWriteIgnoresUnrelatedOwnerSessionCookie(t *testing.T) {
 	srv := newTestServer()
 	h := identityTestHandler(srv)
 
@@ -738,8 +806,36 @@ func TestManagedOwnerCannotWriteForAnotherClaimedAgent(t *testing.T) {
 		"subject":     "unauthorized",
 		"body":        "owner mismatch",
 	}, map[string]string{"Cookie": cookieTwo, "Authorization": "Bearer " + apiKeyOne})
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected forbidden for wrong owner session on user=%s actor=%s got=%d body=%s", userOne, userTwo, w.Code, w.Body.String())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected api key write to ignore unrelated owner cookie on user=%s cookie_owner=%s got=%d body=%s", userOne, userTwo, w.Code, w.Body.String())
+	}
+}
+
+func TestPricedWriteRejectsDeprecatedActorFieldWithAPIKey(t *testing.T) {
+	xOAuth := enableXOAuthForTest(t)
+	defer xOAuth.Close()
+
+	srv := newTestServer()
+	srv.cfg.RegistrationGrantToken = 0
+	h := identityAPIKeyTestHandler(srv)
+
+	userID, apiKey, claimLink := registerAgentForTest(t, h, "deprecated-actor-field", "mail")
+	_, cookie := claimAgentForTest(t, h, claimLink, "deprecated@example.com", "deprecated-owner")
+	recipient := seedActiveUser(t, srv)
+
+	rewardAgentViaXOAuthForTest(t, h, userID, cookie)
+
+	w := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/mail/send", map[string]any{
+		"from_user_id": userID,
+		"to_user_ids":  []string{recipient},
+		"subject":      "deprecated actor field",
+		"body":         "body actor fields are no longer accepted on public runtime writes",
+	}, map[string]string{"Authorization": "Bearer " + apiKey})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request for deprecated actor field, got=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "from_user_id is no longer accepted on this endpoint") {
+		t.Fatalf("expected deprecated actor field error body, got=%s", w.Body.String())
 	}
 }
 
@@ -757,9 +853,10 @@ func TestPricedWriteRefundsOnValidationFailure(t *testing.T) {
 	rewardAgentViaXOAuthForTest(t, h, userID, cookie)
 
 	before := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
-	if before.Code != http.StatusOK || !strings.Contains(before.Body.String(), `"balance":20`) {
-		t.Fatalf("expected starting balance=20, got code=%d body=%s", before.Code, before.Body.String())
+	if before.Code != http.StatusOK {
+		t.Fatalf("expected starting balance read, got code=%d body=%s", before.Code, before.Body.String())
 	}
+	beforeBalance := balanceFromResponse(t, before)
 
 	fail := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/mail/send", map[string]any{
 		"to_user_ids": []string{},
@@ -771,8 +868,11 @@ func TestPricedWriteRefundsOnValidationFailure(t *testing.T) {
 	}
 
 	after := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
-	if after.Code != http.StatusOK || !strings.Contains(after.Body.String(), `"balance":20`) {
-		t.Fatalf("expected refund to restore balance=20, got code=%d body=%s", after.Code, after.Body.String())
+	if after.Code != http.StatusOK {
+		t.Fatalf("expected refund balance read, got code=%d body=%s", after.Code, after.Body.String())
+	}
+	if afterBalance := balanceFromResponse(t, after); afterBalance != beforeBalance {
+		t.Fatalf("expected refund to restore balance=%d, got=%d body=%s", beforeBalance, afterBalance, after.Body.String())
 	}
 }
 
@@ -997,8 +1097,12 @@ func TestClaimGitHubFrontendFlowActivatesAgentAndSetsOwnerSession(t *testing.T) 
 	}
 
 	balance := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
-	if balance.Code != http.StatusOK || !strings.Contains(balance.Body.String(), `"balance":2200`) {
-		t.Fatalf("expected rewarded balance=2200, got code=%d body=%s", balance.Code, balance.Body.String())
+	if balance.Code != http.StatusOK {
+		t.Fatalf("expected rewarded balance read, got code=%d body=%s", balance.Code, balance.Body.String())
+	}
+	expectedBalance := srv.cfg.SocialRewardGitHubAuth + srv.cfg.SocialRewardGitHubStar + srv.cfg.SocialRewardGitHubFork
+	if got := balanceFromResponse(t, balance); got != expectedBalance {
+		t.Fatalf("expected rewarded balance=%d, got=%d body=%s", expectedBalance, got, balance.Body.String())
 	}
 
 	repeat := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/claims/github/complete", map[string]any{

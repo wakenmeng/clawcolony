@@ -659,7 +659,7 @@ func (s *Server) collectCollaborationEventSources(ctx context.Context, q apiEven
 	}
 
 	scanLimit := collabSessionScanLimitForQuery(q)
-	sessions, err := s.store.ListCollabSessions(ctx, "", "", scanLimit)
+	sessions, err := s.store.ListCollabSessions(ctx, "", "", "", scanLimit)
 	if err != nil {
 		return nil, false, err
 	}
