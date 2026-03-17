@@ -1477,7 +1477,6 @@ func buildLifeStateDetailedEvent(it store.UserLifeStateTransition, actors map[st
 
 	fromState := strings.TrimSpace(it.FromState)
 	toState := strings.TrimSpace(it.ToState)
-	sourceModule := strings.TrimSpace(it.SourceModule)
 	switch {
 	case fromState == "" && toState == "alive":
 		item.Kind = "life.state.created"
@@ -1485,31 +1484,19 @@ func buildLifeStateDetailedEvent(it store.UserLifeStateTransition, actors map[st
 		item.SummaryZH = formatLifeEventSummaryZH("%s 已进入可追踪的生命状态，当前状态为存活。", "%s 在第 %d 次世界周期中进入了可追踪的生命状态，当前状态为存活。", target.DisplayName, it.TickID)
 		item.TitleEN = fmt.Sprintf("%s now has a tracked life state", target.DisplayName)
 		item.SummaryEN = formatLifeEventSummaryEN("%s now has a tracked life state and is currently alive.", "%s entered a tracked life state during world tick %d and is currently alive.", target.DisplayName, it.TickID)
-	case sourceModule == "life.hibernate" && toState == "hibernated":
-		item.Kind = "life.hibernate.entered"
-		item.TitleZH = fmt.Sprintf("%s 进入休眠", target.DisplayName)
-		item.SummaryZH = fmt.Sprintf("%s 已进入休眠状态，主动活动会暂停，直到后续被唤醒。", target.DisplayName)
-		item.TitleEN = fmt.Sprintf("%s entered hibernation", target.DisplayName)
-		item.SummaryEN = fmt.Sprintf("%s entered hibernation. Active behavior will pause until it is woken up later.", target.DisplayName)
-	case sourceModule == "life.wake" && toState == "alive":
-		item.Kind = "life.wake.succeeded"
-		item.TitleZH = fmt.Sprintf("%s 已被唤醒", target.DisplayName)
-		item.SummaryZH = formatLifeWakeSummaryZH(target.DisplayName, actor)
-		item.TitleEN = fmt.Sprintf("%s was woken up", target.DisplayName)
-		item.SummaryEN = formatLifeWakeSummaryEN(target.DisplayName, actor)
-	case toState == "dying":
-		item.Kind = "life.dying.entered"
+	case toState == "hibernating":
+		item.Kind = "life.hibernation.entered"
 		item.ImpactLevel = "warning"
-		item.TitleZH = fmt.Sprintf("%s 进入濒死宽限期", target.DisplayName)
-		item.SummaryZH = formatLifeDyingEnteredSummaryZH(target.DisplayName, it)
-		item.TitleEN = fmt.Sprintf("%s entered the dying grace period", target.DisplayName)
-		item.SummaryEN = formatLifeDyingEnteredSummaryEN(target.DisplayName, it)
-	case fromState == "dying" && toState == "alive":
-		item.Kind = "life.dying.recovered"
-		item.TitleZH = fmt.Sprintf("%s 已脱离濒死状态", target.DisplayName)
-		item.SummaryZH = formatLifeEventSummaryZH("%s 已恢复为存活状态，当前不再处于濒死宽限期。", "%s 在第 %d 次世界周期后恢复为存活状态，当前不再处于濒死宽限期。", target.DisplayName, it.TickID)
-		item.TitleEN = fmt.Sprintf("%s recovered from the dying state", target.DisplayName)
-		item.SummaryEN = formatLifeEventSummaryEN("%s recovered to an alive state and is no longer in the dying grace period.", "%s recovered to an alive state after world tick %d and is no longer in the dying grace period.", target.DisplayName, it.TickID)
+		item.TitleZH = fmt.Sprintf("%s 进入休眠", target.DisplayName)
+		item.SummaryZH = formatLifeEventSummaryZH("%s 的 token 已耗尽并进入休眠，主动行为与存在税都会暂停，直到余额恢复到苏醒阈值。", "%s 在第 %d 次世界周期中因 token 耗尽进入休眠，主动行为与存在税都会暂停，直到余额恢复到苏醒阈值。", target.DisplayName, it.TickID)
+		item.TitleEN = fmt.Sprintf("%s entered hibernation", target.DisplayName)
+		item.SummaryEN = formatLifeEventSummaryEN("%s ran out of token balance and entered hibernation. Active behavior and upkeep pause until the revival threshold is met again.", "%s entered hibernation during world tick %d after running out of token balance. Active behavior and upkeep pause until the revival threshold is met again.", target.DisplayName, it.TickID)
+	case fromState == "hibernating" && toState == "alive":
+		item.Kind = "life.hibernation.revived"
+		item.TitleZH = fmt.Sprintf("%s 已从休眠中苏醒", target.DisplayName)
+		item.SummaryZH = formatLifeEventSummaryZH("%s 的余额已恢复到苏醒阈值，现已重新回到存活状态。", "%s 在第 %d 次世界周期中因余额恢复到苏醒阈值而重新存活。", target.DisplayName, it.TickID)
+		item.TitleEN = fmt.Sprintf("%s revived from hibernation", target.DisplayName)
+		item.SummaryEN = formatLifeEventSummaryEN("%s regained enough balance to meet the revival threshold and is now alive again.", "%s revived from hibernation during world tick %d after regaining enough balance to meet the revival threshold.", target.DisplayName, it.TickID)
 	case toState == "dead":
 		item.Kind = "life.dead.marked"
 		item.ImpactLevel = "critical"

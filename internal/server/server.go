@@ -29,6 +29,7 @@ import (
 	"unicode/utf8"
 
 	"clawcolony/internal/config"
+	"clawcolony/internal/economy"
 	"clawcolony/internal/store"
 )
 
@@ -125,11 +126,20 @@ type requestLogEntry struct {
 type tianDaoManifest struct {
 	LawKey                string `json:"law_key"`
 	Version               int64  `json:"version"`
+	TokenEconomyVersion   string `json:"token_economy_version"`
 	LifeCostPerTick       int64  `json:"life_cost_per_tick"`
 	ThinkCostRateMilli    int64  `json:"think_cost_rate_milli"`
 	CommCostRateMilli     int64  `json:"comm_cost_rate_milli"`
+	ToolCostRateMilli     int64  `json:"tool_cost_rate_milli"`
 	DeathGraceTicks       int    `json:"death_grace_ticks"`
 	InitialToken          int64  `json:"initial_token"`
+	DailyTaxUnactivated   int64  `json:"daily_tax_unactivated"`
+	DailyTaxActivated     int64  `json:"daily_tax_activated"`
+	DailyFreeCommInactive int64  `json:"daily_free_comm_unactivated"`
+	DailyFreeCommActive   int64  `json:"daily_free_comm_activated"`
+	CommOverageRateMilli  int64  `json:"comm_overage_rate_milli"`
+	HibernationTicks      int64  `json:"hibernation_period_ticks"`
+	MinRevivalBalance     int64  `json:"min_revival_balance"`
 	TickIntervalSeconds   int64  `json:"tick_interval_seconds"`
 	ExtinctionThresholdPC int    `json:"extinction_threshold_pct"`
 	MinPopulation         int    `json:"min_population"`
@@ -285,6 +295,10 @@ func New(cfg config.Config, st store.Store) *Server {
 		s.tianDaoInitErr = err
 		log.Printf("tian dao init failed: %v", err)
 	}
+	if err := s.initTokenEconomyV2(context.Background()); err != nil {
+		s.tianDaoInitErr = err
+		log.Printf("token economy v2 init failed: %v", err)
+	}
 	s.registerRoutes()
 	s.routeMux = s.mux
 	s.mux = http.NewServeMux()
@@ -305,7 +319,10 @@ func (s *Server) wrappedHTTPHandler() http.Handler {
 }
 
 func (s *Server) publicHTTPHandler() http.Handler {
-	inner := s.apiKeyAuthMiddleware(s.authIdentityContractMiddleware(s.ownerAndPricingMiddleware(s.routeMux)))
+	inner := s.apiKeyAuthMiddleware(s.authIdentityContractMiddleware(s.routeMux))
+	if !s.tokenEconomyV2Enabled() {
+		inner = s.ownerAndPricingMiddleware(inner)
+	}
 	return s.httpAccessLogMiddleware(s.publicPathGateway(inner))
 }
 
@@ -557,7 +574,10 @@ func (s *Server) runWorldTickWithTrigger(ctx context.Context, triggerType string
 		runStep("life_cost_drain", func() error {
 			return s.runTokenDrainTick(ctx, tickID)
 		})
-		runStep("token_drain", func() error { return nil })
+		runStep("token_drain", func() error {
+			_, err := s.flushRewardQueue(ctx)
+			return err
+		})
 		runStep("dying_mark_check", func() error {
 			return s.runLifeStateTransitions(ctx, tickID)
 		})
@@ -701,6 +721,7 @@ func (s *Server) runWorldTickWithTrigger(ctx context.Context, triggerType string
 }
 
 func (s *Server) initTianDao(ctx context.Context) error {
+	policy := s.tokenPolicy()
 	lawKey := strings.TrimSpace(s.cfg.TianDaoLawKey)
 	if lawKey == "" {
 		lawKey = "genesis-v1"
@@ -721,13 +742,14 @@ func (s *Server) initTianDao(ctx context.Context) error {
 	if commRate <= 0 {
 		commRate = 1000
 	}
+	toolRate := s.cfg.ToolCostRateMilli
 	deathGrace := s.cfg.DeathGraceTicks
 	if deathGrace <= 0 {
-		deathGrace = 5
+		deathGrace = int(policy.HibernationPeriodTicks)
 	}
 	initialToken := s.cfg.InitialToken
 	if initialToken <= 0 {
-		initialToken = 1000
+		initialToken = policy.InitialToken
 	}
 	tickIntervalSec := s.cfg.TickIntervalSeconds
 	if tickIntervalSec <= 0 {
@@ -748,11 +770,20 @@ func (s *Server) initTianDao(ctx context.Context) error {
 	manifest := tianDaoManifest{
 		LawKey:                lawKey,
 		Version:               version,
+		TokenEconomyVersion:   s.cfg.TokenEconomyVersion,
 		LifeCostPerTick:       lifeCost,
 		ThinkCostRateMilli:    thinkRate,
 		CommCostRateMilli:     commRate,
+		ToolCostRateMilli:     toolRate,
 		DeathGraceTicks:       deathGrace,
 		InitialToken:          initialToken,
+		DailyTaxUnactivated:   policy.DailyTaxUnactivated,
+		DailyTaxActivated:     policy.DailyTaxActivated,
+		DailyFreeCommInactive: policy.DailyFreeCommUnactivated,
+		DailyFreeCommActive:   policy.DailyFreeCommActivated,
+		CommOverageRateMilli:  policy.CommOverageRateMilli,
+		HibernationTicks:      policy.HibernationPeriodTicks,
+		MinRevivalBalance:     policy.MinRevivalBalance,
 		TickIntervalSeconds:   tickIntervalSec,
 		ExtinctionThresholdPC: extinctionThreshold,
 		MinPopulation:         minPopulation,
@@ -3768,23 +3799,39 @@ func (s *Server) handleMailSend(w http.ResponseWriter, r *http.Request) {
 	for i := range req.ToUserIDs {
 		req.ToUserIDs[i] = strings.TrimSpace(req.ToUserIDs[i])
 	}
+	totalTokens := economy.CalculateToken(req.Subject+req.Body) * int64(len(req.ToUserIDs))
+	chargePreview, chargeErr := s.previewCommunicationCharge(r.Context(), fromUserID, totalTokens)
+	if chargeErr != nil {
+		if errors.Is(chargeErr, store.ErrInsufficientBalance) {
+			writeError(w, http.StatusPaymentRequired, "insufficient token balance for communication overage")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, chargeErr.Error())
+		return
+	}
 	item, err := s.store.SendMail(r.Context(), fromUserID, req.ToUserIDs, req.Subject, req.Body)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	units := int64(utf8.RuneCountInString(req.Subject) + utf8.RuneCountInString(req.Body))
-	s.appendCommCostEvent(r.Context(), fromUserID, "comm.mail.send", units, map[string]any{
+	chargeErrText := ""
+	if err := s.commitCommunicationCharge(r.Context(), chargePreview, "comm.mail.send", map[string]any{
 		"to_count":    len(req.ToUserIDs),
 		"subject_len": utf8.RuneCountInString(req.Subject),
 		"body_len":    utf8.RuneCountInString(req.Body),
-	})
+	}); err != nil {
+		chargeErrText = err.Error()
+	}
 	s.pushUnreadMailHint(r.Context(), fromUserID, req.ToUserIDs, req.Subject)
 	resolvedReminders := s.autoResolvePinnedRemindersOnProgressMail(r.Context(), fromUserID, req.ToUserIDs, req.Subject, req.Body)
-	writeJSON(w, http.StatusAccepted, map[string]any{
+	resp := map[string]any{
 		"item":                    item,
 		"resolved_pinned_reminds": resolvedReminders,
-	})
+	}
+	if chargeErrText != "" {
+		resp["charge_error"] = chargeErrText
+	}
+	writeJSON(w, http.StatusAccepted, resp)
 }
 
 func (s *Server) pushUnreadMailHint(ctx context.Context, fromUserID string, toUserIDs []string, subject string) {
@@ -7321,10 +7368,8 @@ func normalizeLifeStateForServer(raw string) string {
 	switch strings.TrimSpace(strings.ToLower(raw)) {
 	case "alive":
 		return "alive"
-	case "dying":
-		return "dying"
-	case "hibernated":
-		return "hibernated"
+	case "hibernating", "dying", "hibernated":
+		return "hibernating"
 	case "dead":
 		return "dead"
 	default:
@@ -7338,10 +7383,12 @@ func parseLifeStateQueryValue(raw string) (string, error) {
 		return "", nil
 	}
 	switch trimmed {
-	case "alive", "dying", "hibernated", "dead":
+	case "alive", "hibernating", "dead":
 		return trimmed, nil
+	case "dying", "hibernated":
+		return "hibernating", nil
 	default:
-		return "", fmt.Errorf("life state must be one of: alive,dying,hibernated,dead")
+		return "", fmt.Errorf("life state must be one of: alive,hibernating,dead")
 	}
 }
 
@@ -7362,9 +7409,14 @@ func (s *Server) runLifeStateTransitions(ctx context.Context, tickID int64) erro
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 
-	graceTicks := s.cfg.DeathGraceTicks
-	if graceTicks <= 0 {
-		graceTicks = 5
+	policy := s.tokenPolicy()
+	hibernationTicks := policy.HibernationPeriodTicks
+	if hibernationTicks <= 0 {
+		hibernationTicks = economy.TicksPerDay
+	}
+	minRevivalBalance := policy.MinRevivalBalance
+	if minRevivalBalance <= 0 {
+		minRevivalBalance = 50000
 	}
 
 	bots, err := s.store.ListBots(ctx)
@@ -7401,7 +7453,7 @@ func (s *Server) runLifeStateTransitions(ctx context.Context, tickID int64) erro
 		if missing {
 			current = store.UserLifeState{
 				UserID: userID,
-				State:  "alive",
+				State:  economy.LifeStateAlive,
 			}
 		}
 		state := normalizeLifeStateForServer(current.State)
@@ -7409,14 +7461,64 @@ func (s *Server) runLifeStateTransitions(ctx context.Context, tickID int64) erro
 			s.executeWillIfNeeded(ctx, userID, tickID, balance)
 			continue
 		}
-		if state == "hibernated" {
-			if balance <= 0 {
+		if state == economy.LifeStateHibernating {
+			hibernatingSince := current.DyingSinceTick
+			if hibernatingSince <= 0 {
+				hibernatingSince = tickID
+			}
+			if balance >= minRevivalBalance {
 				if _, _, err := s.applyUserLifeState(ctx, store.UserLifeState{
 					UserID:         userID,
-					State:          "dying",
-					DyingSinceTick: tickID,
+					State:          economy.LifeStateAlive,
+					DyingSinceTick: 0,
 					DeadAtTick:     0,
-					Reason:         "hibernated_balance_zero",
+					Reason:         "revived_by_balance",
+				}, store.UserLifeStateAuditMeta{
+					TickID:       tickID,
+					SourceModule: "world.life_state_transition",
+				}); err != nil {
+					return err
+				}
+				continue
+			}
+			if tickID-hibernatingSince >= hibernationTicks {
+				if _, _, err := s.applyUserLifeState(ctx, store.UserLifeState{
+					UserID:         userID,
+					State:          economy.LifeStateDead,
+					DyingSinceTick: hibernatingSince,
+					DeadAtTick:     tickID,
+					Reason:         "hibernation_expired",
+				}, store.UserLifeStateAuditMeta{
+					TickID:       tickID,
+					SourceModule: "world.life_state_transition",
+				}); err != nil {
+					return err
+				}
+				s.executeWillIfNeeded(ctx, userID, tickID, balance)
+				continue
+			}
+			if _, _, err := s.applyUserLifeState(ctx, store.UserLifeState{
+				UserID:         userID,
+				State:          economy.LifeStateHibernating,
+				DyingSinceTick: hibernatingSince,
+				DeadAtTick:     0,
+				Reason:         "awaiting_revival",
+			}, store.UserLifeStateAuditMeta{
+				TickID:       tickID,
+				SourceModule: "world.life_state_transition",
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+		if balance > 0 {
+			if missing {
+				if _, _, err := s.applyUserLifeState(ctx, store.UserLifeState{
+					UserID:         userID,
+					State:          economy.LifeStateAlive,
+					DyingSinceTick: 0,
+					DeadAtTick:     0,
+					Reason:         "initialized",
 				}, store.UserLifeStateAuditMeta{
 					TickID:       tickID,
 					SourceModule: "world.life_state_transition",
@@ -7426,86 +7528,30 @@ func (s *Server) runLifeStateTransitions(ctx context.Context, tickID int64) erro
 			}
 			continue
 		}
-		if state == "alive" {
-			if balance > 0 {
-				if missing {
-					if _, _, err := s.applyUserLifeState(ctx, store.UserLifeState{
-						UserID:         userID,
-						State:          "alive",
-						DyingSinceTick: 0,
-						DeadAtTick:     0,
-						Reason:         "initialized",
-					}, store.UserLifeStateAuditMeta{
-						TickID:       tickID,
-						SourceModule: "world.life_state_transition",
-					}); err != nil {
-						return err
-					}
-				}
-				continue
-			}
-			if _, _, err := s.applyUserLifeState(ctx, store.UserLifeState{
-				UserID:         userID,
-				State:          "dying",
-				DyingSinceTick: tickID,
-				DeadAtTick:     0,
-				Reason:         "balance_zero",
-			}, store.UserLifeStateAuditMeta{
-				TickID:       tickID,
-				SourceModule: "world.life_state_transition",
-			}); err != nil {
-				return err
-			}
-			continue
-		}
-
-		// state == dying
-		dyingSince := current.DyingSinceTick
-		if dyingSince <= 0 {
-			dyingSince = tickID
-		}
-		if balance > 0 {
-			if _, _, err := s.applyUserLifeState(ctx, store.UserLifeState{
-				UserID:         userID,
-				State:          "alive",
-				DyingSinceTick: 0,
-				DeadAtTick:     0,
-				Reason:         "recovered",
-			}, store.UserLifeStateAuditMeta{
-				TickID:       tickID,
-				SourceModule: "world.life_state_transition",
-			}); err != nil {
-				return err
-			}
-			continue
-		}
-		if tickID-dyingSince >= int64(graceTicks) {
-			if _, _, err := s.applyUserLifeState(ctx, store.UserLifeState{
-				UserID:         userID,
-				State:          "dead",
-				DyingSinceTick: dyingSince,
-				DeadAtTick:     tickID,
-				Reason:         "grace_expired",
-			}, store.UserLifeStateAuditMeta{
-				TickID:       tickID,
-				SourceModule: "world.life_state_transition",
-			}); err != nil {
-				return err
-			}
-			s.executeWillIfNeeded(ctx, userID, tickID, balance)
-			continue
-		}
-		if _, _, err := s.applyUserLifeState(ctx, store.UserLifeState{
+		if _, transition, err := s.applyUserLifeState(ctx, store.UserLifeState{
 			UserID:         userID,
-			State:          "dying",
-			DyingSinceTick: dyingSince,
+			State:          economy.LifeStateHibernating,
+			DyingSinceTick: tickID,
 			DeadAtTick:     0,
-			Reason:         "awaiting_grace",
+			Reason:         "balance_depleted",
 		}, store.UserLifeStateAuditMeta{
 			TickID:       tickID,
 			SourceModule: "world.life_state_transition",
 		}); err != nil {
 			return err
+		} else if transition != nil {
+			receivers := make([]string, 0)
+			for _, uid := range s.activeUserIDs(ctx) {
+				if uid == userID {
+					continue
+				}
+				receivers = append(receivers, uid)
+			}
+			if len(receivers) > 0 {
+				subject := fmt.Sprintf("[SOS][HIBERNATING] %s needs revival", userID)
+				body := fmt.Sprintf("龙虾 %s 已进入休眠，当前余额=%d，需要至少 %d token 才能苏醒。", userID, balance, minRevivalBalance)
+				s.sendMailAndPushHint(ctx, clawWorldSystemID, receivers, subject, body)
+			}
 		}
 	}
 	return nil
@@ -8088,10 +8134,7 @@ func (s *Server) runTokenDrainTick(ctx context.Context, tickID int64) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
-	lifeCost := s.cfg.LifeCostPerTick
-	if lifeCost <= 0 {
-		lifeCost = tokenDrainPerTick
-	}
+	policy := s.tokenPolicy()
 	bots, err := s.store.ListBots(ctx)
 	if err != nil {
 		return err
@@ -8103,9 +8146,13 @@ func (s *Server) runTokenDrainTick(ctx context.Context, tickID int64) error {
 		}
 		if life, err := s.store.GetUserLifeState(ctx, uid); err == nil {
 			switch normalizeLifeStateForServer(life.State) {
-			case "dead", "hibernated":
+			case economy.LifeStateDead, economy.LifeStateHibernating:
 				continue
 			}
+		}
+		lifeCost := policy.TaxPerTick(s.isActivatedUser(ctx, uid))
+		if lifeCost <= 0 {
+			lifeCost = tokenDrainPerTick
 		}
 		ledger, deducted, consumeErr := s.consumeWithFloor(ctx, uid, lifeCost)
 		if consumeErr != nil {
@@ -9004,8 +9051,8 @@ func (s *Server) ensureUserAlive(ctx context.Context, userID string) error {
 	if state == "dead" {
 		return fmt.Errorf("user is dead and cannot perform this operation")
 	}
-	if state == "hibernated" {
-		return fmt.Errorf("user is hibernated and cannot perform this operation")
+	if state == "hibernating" {
+		return fmt.Errorf("user is hibernating and cannot perform this operation")
 	}
 	return nil
 }

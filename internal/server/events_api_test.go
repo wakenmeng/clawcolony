@@ -373,9 +373,9 @@ func TestAPIEventsReturnsLifeDetailedEventsAndSupportsUserFilter(t *testing.T) {
 		t.Fatalf("life state created event should expose bilingual readable titles: %+v", *created)
 	}
 
-	dying := findAPIEventByKindAndTarget(resp.Items, "life.dying.entered", fixture.dyingUserID)
-	if dying == nil || dying.ImpactLevel != "warning" {
-		t.Fatalf("expected warning life.dying.entered event, got=%+v", dying)
+	hibernating := findAPIEventByKindAndTarget(resp.Items, "life.hibernation.entered", fixture.dyingUserID)
+	if hibernating == nil || hibernating.ImpactLevel != "warning" {
+		t.Fatalf("expected warning life.hibernation.entered event, got=%+v", hibernating)
 	}
 
 	dead := findAPIEventByKindAndTarget(resp.Items, "life.dead.marked", fixture.dyingUserID)
@@ -386,12 +386,12 @@ func TestAPIEventsReturnsLifeDetailedEventsAndSupportsUserFilter(t *testing.T) {
 		t.Fatalf("life.dead.marked should explain user-visible impact: %+v", *dead)
 	}
 
-	wake := findAPIEventByKindAndTarget(resp.Items, "life.wake.succeeded", fixture.wakeUserID)
-	if wake == nil {
-		t.Fatalf("expected life.wake.succeeded event, body=%s", w.Body.String())
+	revived := findAPIEventByKindAndTarget(resp.Items, "life.hibernation.revived", fixture.wakeUserID)
+	if revived == nil {
+		t.Fatalf("expected life.hibernation.revived event, body=%s", w.Body.String())
 	}
-	if len(wake.Actors) != 1 || wake.Actors[0].DisplayName != "lobster-healer" {
-		t.Fatalf("wake event should retain actor display_name fallback: %+v", *wake)
+	if len(revived.Targets) != 1 || revived.Targets[0].UserID != fixture.wakeUserID {
+		t.Fatalf("revival event should target the revived user: %+v", *revived)
 	}
 
 	w = doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/events?user_id="+fixture.dyingUserID+"&limit=50", nil)
@@ -410,9 +410,6 @@ func TestAPIEventsReturnsLifeDetailedEventsAndSupportsUserFilter(t *testing.T) {
 	for _, it := range scoped.Items {
 		if !apiEventInvolvesUser(it, fixture.dyingUserID) {
 			t.Fatalf("user filter returned unrelated item: %+v", it)
-		}
-		if it.Category != "life" {
-			t.Fatalf("current user-scoped slice should only contain life events: %+v", it)
 		}
 	}
 }
@@ -1356,7 +1353,7 @@ type lifeEventsFixture struct {
 
 func seedLifeEventsFixture(t *testing.T, srv *Server, ctx context.Context) lifeEventsFixture {
 	t.Helper()
-	srv.cfg.DeathGraceTicks = 1
+	srv.cfg.HibernationPeriodTicks = 1
 
 	dyingUserID, _ := seedActiveUserWithAPIKey(t, srv)
 	nickname := "小钳"
@@ -1383,31 +1380,21 @@ func seedLifeEventsFixture(t *testing.T, srv *Server, ctx context.Context) lifeE
 		t.Fatalf("run life transitions tick3: %v", err)
 	}
 
-	wakeUserID, wakeUserAPIKey := seedActiveUserWithAPIKey(t, srv)
-	wakeActor := newAuthUser(t, srv)
-	wakeNickname := "lobster-healer"
-	if _, err := srv.store.UpsertBot(ctx, store.BotUpsertInput{
-		BotID:       wakeActor.id,
-		Name:        "wake-actor",
-		Nickname:    &wakeNickname,
-		Provider:    "openclaw",
-		Status:      "running",
-		Initialized: true,
-	}); err != nil {
-		t.Fatalf("set wake actor nickname: %v", err)
+	wakeUserID, _ := seedActiveUserWithAPIKey(t, srv)
+	if err := srv.runLifeStateTransitions(ctx, 4); err != nil {
+		t.Fatalf("run life transitions tick4: %v", err)
 	}
-	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/life/hibernate", map[string]any{
-		"reason": "manual-rest",
-	}, apiKeyHeaders(wakeUserAPIKey))
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("hibernate status=%d body=%s", w.Code, w.Body.String())
+	if _, err := srv.store.Consume(ctx, wakeUserID, 1000); err != nil {
+		t.Fatalf("consume all balance for wake user: %v", err)
 	}
-	w = doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/life/wake", map[string]any{
-		"user_id": wakeUserID,
-		"reason":  "manual-wake",
-	}, wakeActor.headers())
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("wake status=%d body=%s", w.Code, w.Body.String())
+	if err := srv.runLifeStateTransitions(ctx, 5); err != nil {
+		t.Fatalf("run life transitions tick5: %v", err)
+	}
+	if _, err := srv.store.Recharge(ctx, wakeUserID, srv.cfg.MinRevivalBalance); err != nil {
+		t.Fatalf("recharge wake user for revival: %v", err)
+	}
+	if err := srv.runLifeStateTransitions(ctx, 6); err != nil {
+		t.Fatalf("run life transitions tick6: %v", err)
 	}
 
 	return lifeEventsFixture{

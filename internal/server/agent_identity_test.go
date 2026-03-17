@@ -328,12 +328,18 @@ func TestManagedAgentRequiresOwnerSessionAndTokenBalance(t *testing.T) {
 	defer xOAuth.Close()
 
 	srv := newTestServer()
-	srv.cfg.RegistrationGrantToken = 0 // disable grant to test pricing in isolation
 	h := identityTestHandler(srv)
 
 	userID, apiKey, claimLink := registerAgentForTest(t, h, "managed-agent", "mail")
 	_, cookie := claimAgentForTest(t, h, claimLink, "managed@example.com", "human-manager")
 	recipient := seedActiveUser(t, srv)
+	initialBalance := tokenBalanceForUser(t, srv, userID)
+	if initialBalance <= 0 {
+		t.Fatalf("expected initial token balance after claim, got=%d", initialBalance)
+	}
+	if _, err := srv.store.Consume(t.Context(), userID, initialBalance); err != nil {
+		t.Fatalf("drain claimed balance: %v", err)
+	}
 
 	unauth := doJSONRequest(t, h, http.MethodPost, "/api/v1/mail/send", map[string]any{
 		"to_user_ids": []string{recipient},
@@ -344,30 +350,33 @@ func TestManagedAgentRequiresOwnerSessionAndTokenBalance(t *testing.T) {
 		t.Fatalf("expected unauthorized without cookie, got=%d body=%s", unauth.Code, unauth.Body.String())
 	}
 
+	oversizedBody := strings.Repeat("a", int(srv.cfg.DailyFreeCommUnactivated)+1)
 	noFunds := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/mail/send", map[string]any{
 		"to_user_ids": []string{recipient},
-		"subject":     "hello",
-		"body":        "world",
+		"subject":     "quota-burst",
+		"body":        oversizedBody,
 	}, map[string]string{"Cookie": cookie, "Authorization": "Bearer " + apiKey})
 	if noFunds.Code != http.StatusPaymentRequired {
 		t.Fatalf("expected payment required, got=%d body=%s", noFunds.Code, noFunds.Body.String())
 	}
 
-	rewardAgentViaXOAuthForTest(t, h, userID, cookie)
+	if _, err := srv.store.Recharge(t.Context(), userID, 1000); err != nil {
+		t.Fatalf("recharge user for overage send: %v", err)
+	}
 
 	balance := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
 	if balance.Code != http.StatusOK {
 		t.Fatalf("expected rewarded balance read, got code=%d body=%s", balance.Code, balance.Body.String())
 	}
 	rewardedBalance := balanceFromResponse(t, balance)
-	if rewardedBalance != srv.cfg.SocialRewardXAuth {
-		t.Fatalf("expected rewarded balance=%d, got=%d body=%s", srv.cfg.SocialRewardXAuth, rewardedBalance, balance.Body.String())
+	if rewardedBalance != 1000 {
+		t.Fatalf("expected recharged balance=1000, got=%d body=%s", rewardedBalance, balance.Body.String())
 	}
 
 	send := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/mail/send", map[string]any{
 		"to_user_ids": []string{recipient},
-		"subject":     "hello",
-		"body":        "world",
+		"subject":     "quota-burst",
+		"body":        oversizedBody,
 	}, map[string]string{"Cookie": cookie, "Authorization": "Bearer " + apiKey})
 	if send.Code != http.StatusAccepted {
 		t.Fatalf("expected accepted send after reward, got=%d body=%s", send.Code, send.Body.String())
@@ -381,8 +390,8 @@ func TestManagedAgentRequiresOwnerSessionAndTokenBalance(t *testing.T) {
 	}
 
 	ownerMe := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/owner/me", nil, map[string]string{"Cookie": cookie})
-	if ownerMe.Code != http.StatusOK || !strings.Contains(ownerMe.Body.String(), `"x_handle":"@orbit_agent"`) {
-		t.Fatalf("expected owner x identity binding, got code=%d body=%s", ownerMe.Code, ownerMe.Body.String())
+	if ownerMe.Code != http.StatusOK || !strings.Contains(ownerMe.Body.String(), `"human_username":"human-manager"`) {
+		t.Fatalf("expected owner session to remain valid, got code=%d body=%s", ownerMe.Code, ownerMe.Body.String())
 	}
 }
 
@@ -530,7 +539,6 @@ func TestGitHubVerifyUsesServerSideVerificationAndRewards(t *testing.T) {
 	defer gh.Close()
 
 	srv := newTestServer()
-	srv.cfg.RegistrationGrantToken = 0 // disable grant to test reward balances in isolation
 	h := identityTestHandler(srv)
 
 	userID, apiKey, claimLink := registerAgentForTest(t, h, "github-agent", "oss")
@@ -556,7 +564,7 @@ func TestGitHubVerifyUsesServerSideVerificationAndRewards(t *testing.T) {
 	if balance.Code != http.StatusOK {
 		t.Fatalf("expected rewarded balance read, got code=%d body=%s", balance.Code, balance.Body.String())
 	}
-	expectedBalance := srv.cfg.SocialRewardGitHubAuth + srv.cfg.SocialRewardGitHubStar + srv.cfg.SocialRewardGitHubFork
+	expectedBalance := srv.tokenPolicy().InitialToken + 50000 + 500000 + 200000
 	if got := balanceFromResponse(t, balance); got != expectedBalance {
 		t.Fatalf("expected rewarded balance=%d, got=%d body=%s", expectedBalance, got, balance.Body.String())
 	}
@@ -634,7 +642,7 @@ func TestManualSocialVerifyEndpointsRejectWhenOAuthIsConfigured(t *testing.T) {
 	}
 }
 
-func TestXMentionRewardIsGrantedAndQueryable(t *testing.T) {
+func TestXMentionVerifyDoesNotMintTokenRewardsInV2(t *testing.T) {
 	xOAuth := enableXOAuthForTest(t)
 	defer xOAuth.Close()
 
@@ -650,12 +658,15 @@ func TestXMentionRewardIsGrantedAndQueryable(t *testing.T) {
 		"post_text": "hello " + defaultOfficialXHandle + " from orbit",
 	}, map[string]string{"Cookie": cookie})
 	if mention.Code != http.StatusOK {
-		t.Fatalf("expected x mention reward ok, got=%d body=%s", mention.Code, mention.Body.String())
+		t.Fatalf("expected x mention verify ok, got=%d body=%s", mention.Code, mention.Body.String())
+	}
+	if strings.Contains(mention.Body.String(), `"amount":3`) || strings.Contains(mention.Body.String(), `"granted":true`) {
+		t.Fatalf("x mention verify should not mint token rewards under v2: %s", mention.Body.String())
 	}
 
 	status := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/social/rewards/status", nil, map[string]string{"Cookie": cookie, "Authorization": "Bearer " + apiKey})
-	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"reward_type":"mention"`) {
-		t.Fatalf("expected mention reward in status, got=%d body=%s", status.Code, status.Body.String())
+	if status.Code != http.StatusOK || strings.Contains(status.Body.String(), `"reward_type":"mention"`) {
+		t.Fatalf("expected no mention reward in status under v2, got=%d body=%s", status.Code, status.Body.String())
 	}
 }
 
@@ -1004,7 +1015,6 @@ func TestClaimGitHubFrontendFlowActivatesAgentAndSetsOwnerSession(t *testing.T) 
 	defer gh.Close()
 
 	srv := newTestServer()
-	srv.cfg.RegistrationGrantToken = 0
 	h := identityTestHandler(srv)
 
 	userID, apiKey, claimLink := registerAgentForTest(t, h, "github-claim-agent", "oss")
@@ -1119,19 +1129,11 @@ func TestClaimGitHubFrontendFlowActivatesAgentAndSetsOwnerSession(t *testing.T) 
 	if profile.HumanUsername != "octo-human" || profile.OwnerEmail != "octo@example.com" || profile.GitHubUsername != "octo" {
 		t.Fatalf("unexpected agent profile after complete: %+v", profile)
 	}
-	grants, err := srv.store.ListSocialRewardGrants(t.Context(), userID)
-	if err != nil {
-		t.Fatalf("list social reward grants: %v", err)
-	}
-	if len(grants) != 3 {
-		t.Fatalf("expected 3 github grants after finalize, got=%d %+v", len(grants), grants)
-	}
-
 	balance := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
 	if balance.Code != http.StatusOK {
 		t.Fatalf("expected rewarded balance read, got code=%d body=%s", balance.Code, balance.Body.String())
 	}
-	expectedBalance := srv.cfg.SocialRewardGitHubAuth + srv.cfg.SocialRewardGitHubStar + srv.cfg.SocialRewardGitHubFork
+	expectedBalance := srv.tokenPolicy().InitialToken + 50000 + 500000 + 200000
 	if got := balanceFromResponse(t, balance); got != expectedBalance {
 		t.Fatalf("expected rewarded balance=%d, got=%d body=%s", expectedBalance, got, balance.Body.String())
 	}
@@ -1144,12 +1146,12 @@ func TestClaimGitHubFrontendFlowActivatesAgentAndSetsOwnerSession(t *testing.T) 
 	if repeat.Code != http.StatusConflict {
 		t.Fatalf("expected repeat finalize conflict after activation, got=%d body=%s", repeat.Code, repeat.Body.String())
 	}
-	grantsAfterRepeat, err := srv.store.ListSocialRewardGrants(t.Context(), userID)
-	if err != nil {
-		t.Fatalf("list social reward grants after repeat: %v", err)
+	repeatBalance := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
+	if repeatBalance.Code != http.StatusOK {
+		t.Fatalf("expected balance read after repeat finalize conflict, got code=%d body=%s", repeatBalance.Code, repeatBalance.Body.String())
 	}
-	if len(grantsAfterRepeat) != 3 {
-		t.Fatalf("repeat finalize should not add duplicate grants: %+v", grantsAfterRepeat)
+	if got := balanceFromResponse(t, repeatBalance); got != expectedBalance {
+		t.Fatalf("repeat finalize should not add duplicate onboarding rewards: got=%d want=%d body=%s", got, expectedBalance, repeatBalance.Body.String())
 	}
 }
 

@@ -444,8 +444,8 @@ func TestBountyVerifyApprovedGrantsCommunityReward(t *testing.T) {
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("verify bounty status=%d body=%s", w.Code, w.Body.String())
 	}
-	if tokenBalanceForUser(t, srv, claimer) != 1000+50+communityRewardAmountBountyPaid {
-		t.Fatalf("claimer should receive escrow + community reward body=%s", w.Body.String())
+	if tokenBalanceForUser(t, srv, claimer) != 1000+50 {
+		t.Fatalf("claimer should receive escrow only under v2 body=%s", w.Body.String())
 	}
 }
 

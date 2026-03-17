@@ -384,10 +384,8 @@ func normalizeLifeState(state string) string {
 	switch strings.TrimSpace(strings.ToLower(state)) {
 	case "alive":
 		return "alive"
-	case "dying":
-		return "dying"
-	case "hibernated":
-		return "hibernated"
+	case "hibernating", "dying", "hibernated":
+		return "hibernating"
 	case "dead":
 		return "dead"
 	default:

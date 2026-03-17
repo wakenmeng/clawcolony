@@ -10,16 +10,19 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"clawcolony/internal/store"
 )
 
 type toolRegisterRequest struct {
-	ToolID      string `json:"tool_id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Tier        string `json:"tier"`
-	Manifest    string `json:"manifest"`
-	Code        string `json:"code"`
-	Temporality string `json:"temporality"`
+	ToolID       string `json:"tool_id"`
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	Tier         string `json:"tier"`
+	Manifest     string `json:"manifest"`
+	Code         string `json:"code"`
+	Temporality  string `json:"temporality"`
+	CategoryHint string `json:"category_hint,omitempty"`
 }
 
 type toolReviewRequest struct {
@@ -206,6 +209,7 @@ func (s *Server) handleToolRegister(w http.ResponseWriter, r *http.Request) {
 	req.Manifest = strings.TrimSpace(req.Manifest)
 	req.Code = strings.TrimSpace(req.Code)
 	req.Temporality = strings.TrimSpace(req.Temporality)
+	req.CategoryHint = strings.TrimSpace(strings.ToLower(req.CategoryHint))
 	if req.ToolID == "" || req.Name == "" {
 		writeError(w, http.StatusBadRequest, "tool_id and name are required")
 		return
@@ -216,17 +220,24 @@ func (s *Server) handleToolRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC()
 	genesisStateMu.Lock()
-	defer genesisStateMu.Unlock()
 	state, err := s.getToolRegistryState(r.Context())
 	if err != nil {
+		genesisStateMu.Unlock()
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	meta := toolEconomyMeta{
+		ToolID:       req.ToolID,
+		AuthorUserID: userID,
+		CategoryHint: req.CategoryHint,
+		PriceToken:   parseToolManifestPrice(req.Manifest),
 	}
 	for i := range state.Items {
 		if state.Items[i].ToolID != req.ToolID {
 			continue
 		}
 		if state.Items[i].Status == "active" {
+			genesisStateMu.Unlock()
 			writeError(w, http.StatusConflict, "tool already active")
 			return
 		}
@@ -242,10 +253,14 @@ func (s *Server) handleToolRegister(w http.ResponseWriter, r *http.Request) {
 		state.Items[i].ReviewedBy = ""
 		state.Items[i].UpdatedAt = now
 		if err := s.saveToolRegistryState(r.Context(), state); err != nil {
+			genesisStateMu.Unlock()
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusAccepted, map[string]any{"item": state.Items[i]})
+		updated := state.Items[i]
+		genesisStateMu.Unlock()
+		_ = s.upsertToolEconomyMeta(r.Context(), meta)
+		writeJSON(w, http.StatusAccepted, map[string]any{"item": updated})
 		return
 	}
 	item := toolRegistryItem{
@@ -263,9 +278,12 @@ func (s *Server) handleToolRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	state.Items = append(state.Items, item)
 	if err := s.saveToolRegistryState(r.Context(), state); err != nil {
+		genesisStateMu.Unlock()
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	genesisStateMu.Unlock()
+	_ = s.upsertToolEconomyMeta(r.Context(), meta)
 	writeJSON(w, http.StatusAccepted, map[string]any{"item": item})
 }
 
@@ -436,6 +454,85 @@ func (s *Server) handleToolInvoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	genesisStateMu.Unlock()
+	pricing := map[string]any{}
+	if s.tokenEconomyV2Enabled() {
+		priceToken := parseToolManifestPrice(item.Manifest)
+		authorUserID := strings.TrimSpace(item.AuthorUserID)
+		if meta, ok, metaErr := s.toolEconomyMetaForID(r.Context(), item.ToolID); metaErr == nil && ok {
+			if meta.PriceToken > 0 {
+				priceToken = meta.PriceToken
+			}
+			if strings.TrimSpace(meta.AuthorUserID) != "" {
+				authorUserID = strings.TrimSpace(meta.AuthorUserID)
+			}
+		}
+		if priceToken > 0 {
+			policy := s.tokenPolicy()
+			creatorShare := (priceToken * policy.ToolCreatorShareMilli) / 1000
+			if isExcludedTokenUserID(authorUserID) {
+				creatorShare = 0
+			}
+			treasuryShare := priceToken - creatorShare
+			debit, err := s.store.Consume(r.Context(), userID, priceToken)
+			if err != nil {
+				if err == store.ErrInsufficientBalance {
+					writeError(w, http.StatusPaymentRequired, "insufficient token balance for tool price")
+					return
+				}
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if creatorShare > 0 {
+				if _, err := s.store.Recharge(r.Context(), authorUserID, creatorShare); err != nil {
+					_, _ = s.store.Recharge(r.Context(), userID, priceToken)
+					writeError(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+			}
+			if treasuryShare > 0 {
+				if _, err := s.ensureTreasuryAccount(r.Context()); err != nil {
+					_, _ = s.store.Recharge(r.Context(), userID, priceToken)
+					if creatorShare > 0 {
+						_, _ = s.store.Consume(r.Context(), authorUserID, creatorShare)
+					}
+					writeError(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+				if _, err := s.store.Recharge(r.Context(), clawTreasurySystemID, treasuryShare); err != nil {
+					_, _ = s.store.Recharge(r.Context(), userID, priceToken)
+					if creatorShare > 0 {
+						_, _ = s.store.Consume(r.Context(), authorUserID, creatorShare)
+					}
+					writeError(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+			}
+			meta := map[string]any{
+				"tool_id":        req.ToolID,
+				"price_token":    priceToken,
+				"creator_share":  creatorShare,
+				"treasury_share": treasuryShare,
+				"author_user_id": authorUserID,
+				"balance_after":  debit.BalanceAfter,
+			}
+			metaRaw, _ := json.Marshal(meta)
+			_, _ = s.store.AppendCostEvent(r.Context(), store.CostEvent{
+				UserID:   userID,
+				TickID:   s.currentTickID(),
+				CostType: "tool.invoke.price",
+				Amount:   priceToken,
+				Units:    1,
+				MetaJSON: string(metaRaw),
+			})
+			pricing = map[string]any{
+				"price_token":          priceToken,
+				"creator_share":        creatorShare,
+				"treasury_share":       treasuryShare,
+				"author_user_id":       authorUserID,
+				"caller_balance_after": debit.BalanceAfter,
+			}
+		}
+	}
 	paramsRaw, _ := json.Marshal(req.Params)
 	result := toolSandboxResult{
 		OK:             true,
@@ -474,12 +571,18 @@ func (s *Server) handleToolInvoke(w http.ResponseWriter, r *http.Request) {
 	if result.Message != "" {
 		meta["message"] = result.Message
 	}
-	s.appendToolCostEvent(r.Context(), userID, costType, 1, meta)
-	writeJSON(w, http.StatusAccepted, map[string]any{
+	if !s.tokenEconomyV2Enabled() {
+		s.appendToolCostEvent(r.Context(), userID, costType, 1, meta)
+	}
+	resp := map[string]any{
 		"tool_id": req.ToolID,
 		"tier":    item.Tier,
 		"result":  result,
-	})
+	}
+	if len(pricing) > 0 {
+		resp["pricing"] = pricing
+	}
+	writeJSON(w, http.StatusAccepted, resp)
 }
 
 func (s *Server) handleNPCList(w http.ResponseWriter, r *http.Request) {

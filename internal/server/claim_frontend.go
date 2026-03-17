@@ -608,28 +608,22 @@ func (s *Server) activateClaimFromGitHub(ctx context.Context, w http.ResponseWri
 		return nil, err
 	}
 	s.setOwnerSessionCookie(w, r, sessionToken, expiresAt)
-	grantAmount := s.cfg.RegistrationGrantToken
-	var grantBalance int64
-	if grantAmount > 0 {
-		if _, credit, grantErr := s.transferFromTreasury(ctx, reg.UserID, grantAmount); grantErr != nil {
-			log.Printf("registration_grant_failed user_id=%s amount=%d err=%v", reg.UserID, grantAmount, grantErr)
-		} else {
-			grantBalance = credit.BalanceAfter
-		}
+	grantAmount := s.tokenPolicy().InitialToken
+	grantStatus := ""
+	if decision, grantErr := s.grantInitialTokenDecision(ctx, reg.UserID); grantErr != nil {
+		log.Printf("registration_initial_grant_failed user_id=%s amount=%d err=%v", reg.UserID, grantAmount, grantErr)
+		grantStatus = "error"
+	} else {
+		grantStatus = decision.Status
 	}
-	githubRewards := []map[string]any{
-		s.grantSocialRewardForGitHub(ctx, reg.UserID, "auth_callback", s.socialRewardAmountGitHubAuth()),
-	}
-	if callbackState.Starred {
-		githubRewards = append(githubRewards, s.grantSocialRewardForGitHub(ctx, reg.UserID, "star", s.socialRewardAmountGitHubStar()))
-	}
-	if callbackState.Forked {
-		githubRewards = append(githubRewards, s.grantSocialRewardForGitHub(ctx, reg.UserID, "fork", s.socialRewardAmountGitHubFork()))
+	githubRewards, _, err := s.grantGitHubOnboardingRewards(ctx, owner, reg.UserID, callbackState.Starred, callbackState.Forked, "claim.github.complete")
+	if err != nil {
+		return nil, err
 	}
 	_, _ = s.store.SendMail(ctx, clawWorldSystemID, []string{reg.UserID},
 		"agent/claimed"+refTag(skillHeartbeat),
-		fmt.Sprintf("Your human buddy account claimed this agent identity via GitHub. You received %d tokens to get started.", grantAmount))
-	tokenBalance := grantBalance
+		fmt.Sprintf("Your human buddy account claimed this agent identity via GitHub. Your initial token allocation is %d.", grantAmount))
+	tokenBalance := int64(0)
 	if balances, balErr := s.listTokenBalanceMap(ctx); balErr == nil {
 		tokenBalance = balances[reg.UserID]
 	}
@@ -640,6 +634,7 @@ func (s *Server) activateClaimFromGitHub(ctx context.Context, w http.ResponseWri
 		"owner":         owner,
 		"session_id":    session.SessionID,
 		"grant_tokens":  grantAmount,
+		"grant_status":  grantStatus,
 		"token_balance": tokenBalance,
 		"rewards":       githubRewards,
 		"github": map[string]any{
