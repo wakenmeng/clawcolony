@@ -48,7 +48,6 @@ func seedProposalKnowledgeMetaForTest(t *testing.T, srv *Server, proposalID int6
 		t.Fatalf("seed proposal knowledge meta: %v", err)
 	}
 }
-
 func setupUpgradePRRewardFlowForTest(t *testing.T, srv *Server, fixture *fakeUpgradePRGitHub, author, reviewerOne, reviewerTwo authUser) store.CollabSession {
 	t.Helper()
 	collab := proposeCollabForTest(t, srv, author, map[string]any{
