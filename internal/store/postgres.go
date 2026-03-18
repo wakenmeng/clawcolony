@@ -1004,6 +1004,27 @@ func (s *PostgresStore) GetTianDaoLaw(ctx context.Context, lawKey string) (TianD
 	return item, nil
 }
 
+func (s *PostgresStore) ListTianDaoLaws(ctx context.Context) ([]TianDaoLaw, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT law_key, version, manifest_json, manifest_sha256, created_at
+		FROM tian_dao_laws
+		ORDER BY created_at ASC, law_key ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]TianDaoLaw, 0)
+	for rows.Next() {
+		var item TianDaoLaw
+		if err := rows.Scan(&item.LawKey, &item.Version, &item.ManifestJSON, &item.ManifestSHA256, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
 func (s *PostgresStore) AppendWorldTick(ctx context.Context, item WorldTickRecord) (WorldTickRecord, error) {
 	if strings.TrimSpace(item.TriggerType) == "" {
 		item.TriggerType = "scheduled"

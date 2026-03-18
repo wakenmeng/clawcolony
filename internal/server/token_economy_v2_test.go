@@ -2,12 +2,40 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"clawcolony/internal/economy"
 	"clawcolony/internal/store"
 )
+
+func ensureTestTianDaoLaw(t *testing.T, srv *Server, ctx context.Context, lawKey string, version, initialToken int64) store.TianDaoLaw {
+	t.Helper()
+	manifest := map[string]any{
+		"law_key":       lawKey,
+		"version":       version,
+		"initial_token": initialToken,
+	}
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal law manifest %s: %v", lawKey, err)
+	}
+	sum := sha256.Sum256(raw)
+	law, err := srv.store.EnsureTianDaoLaw(ctx, store.TianDaoLaw{
+		LawKey:         lawKey,
+		Version:        version,
+		ManifestJSON:   string(raw),
+		ManifestSHA256: hex.EncodeToString(sum[:]),
+	})
+	if err != nil {
+		t.Fatalf("ensure tian dao law %s: %v", lawKey, err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	return law
+}
 
 func TestTokenEconomyV2MigrationMovesLegacySettingsIntoStore(t *testing.T) {
 	srv := newTestServer()
@@ -266,14 +294,14 @@ func TestHistoricalInitialTokenTopupMigrationMintsLegacyUsersAndLeavesStateIntac
 
 	legacyUser := "legacy-topup-user"
 	hibernatingUser := "legacy-hibernating-user"
+	legacyTenKUser := "legacy-10k-user"
 	queuedV2User := "queued-onboarding-user"
 	currentV2User := "current-v2-user"
 	registrationOnlyUser := "registration-only-user"
 
-	seedClaimedUser(legacyUser, legacyInitialTokenGrant)
-	seedClaimedUser(hibernatingUser, legacyInitialTokenGrant)
-	seedClaimedUser(queuedV2User, 0)
-	seedClaimedUser(currentV2User, srv.tokenPolicy().InitialToken)
+	ensureTestTianDaoLaw(t, srv, ctx, "legacy-v1", 1, 1000)
+	seedClaimedUser(legacyUser, 1000)
+	seedClaimedUser(hibernatingUser, 1000)
 	if _, err := srv.store.CreateAgentRegistration(ctx, store.AgentRegistrationInput{
 		UserID:            registrationOnlyUser,
 		RequestedUsername: registrationOnlyUser,
@@ -282,6 +310,11 @@ func TestHistoricalInitialTokenTopupMigrationMintsLegacyUsersAndLeavesStateIntac
 	}); err != nil {
 		t.Fatalf("create registration-only user: %v", err)
 	}
+
+	ensureTestTianDaoLaw(t, srv, ctx, "legacy-v2", 2, legacyInitialTokenFallback)
+	seedClaimedUser(legacyTenKUser, legacyInitialTokenFallback)
+	seedClaimedUser(queuedV2User, 0)
+	seedClaimedUser(currentV2User, srv.tokenPolicy().InitialToken)
 
 	if _, err := srv.store.UpsertUserLifeState(ctx, store.UserLifeState{
 		UserID:         hibernatingUser,
@@ -344,14 +377,17 @@ func TestHistoricalInitialTokenTopupMigrationMintsLegacyUsersAndLeavesStateIntac
 	if got := tokenBalanceForUser(t, srv, hibernatingUser); got != srv.tokenPolicy().InitialToken {
 		t.Fatalf("hibernating user balance=%d want %d", got, srv.tokenPolicy().InitialToken)
 	}
+	if got := tokenBalanceForUser(t, srv, legacyTenKUser); got != srv.tokenPolicy().InitialToken {
+		t.Fatalf("legacy 10k user balance=%d want %d", got, srv.tokenPolicy().InitialToken)
+	}
 	if got := tokenBalanceForUser(t, srv, queuedV2User); got != srv.tokenPolicy().InitialToken {
 		t.Fatalf("queued onboarding user balance=%d want %d", got, srv.tokenPolicy().InitialToken)
 	}
 	if got := tokenBalanceForUser(t, srv, currentV2User); got != srv.tokenPolicy().InitialToken {
 		t.Fatalf("current v2 user balance=%d want %d", got, srv.tokenPolicy().InitialToken)
 	}
-	if got := tokenBalanceForUser(t, srv, registrationOnlyUser); got != srv.tokenPolicy().InitialToken-legacyInitialTokenGrant {
-		t.Fatalf("registration-only user balance=%d want %d", got, srv.tokenPolicy().InitialToken-legacyInitialTokenGrant)
+	if got := tokenBalanceForUser(t, srv, registrationOnlyUser); got != srv.tokenPolicy().InitialToken-1000 {
+		t.Fatalf("registration-only user balance=%d want %d", got, srv.tokenPolicy().InitialToken-1000)
 	}
 
 	hibernatingLife, err := srv.store.GetUserLifeState(ctx, hibernatingUser)
@@ -366,7 +402,7 @@ func TestHistoricalInitialTokenTopupMigrationMintsLegacyUsersAndLeavesStateIntac
 	if err != nil {
 		t.Fatalf("get legacy topup decision: %v", err)
 	}
-	if topupDecision.Status != "applied" || topupDecision.Amount != srv.tokenPolicy().InitialToken-legacyInitialTokenGrant {
+	if topupDecision.Status != "applied" || topupDecision.Amount != srv.tokenPolicy().InitialToken-1000 {
 		t.Fatalf("unexpected legacy topup decision: %+v", topupDecision)
 	}
 	hibernatingDecision, err := srv.store.GetEconomyRewardDecision(ctx, "migration:onboarding:initial-topup:"+hibernatingUser)
@@ -375,6 +411,13 @@ func TestHistoricalInitialTokenTopupMigrationMintsLegacyUsersAndLeavesStateIntac
 	}
 	if hibernatingDecision.Status != "applied" {
 		t.Fatalf("unexpected hibernating topup decision: %+v", hibernatingDecision)
+	}
+	legacyTenKDecision, err := srv.store.GetEconomyRewardDecision(ctx, "migration:onboarding:initial-topup:"+legacyTenKUser)
+	if err != nil {
+		t.Fatalf("get legacy 10k topup decision: %v", err)
+	}
+	if legacyTenKDecision.Status != "applied" || legacyTenKDecision.Amount != srv.tokenPolicy().InitialToken-legacyInitialTokenFallback {
+		t.Fatalf("unexpected legacy 10k topup decision: %+v", legacyTenKDecision)
 	}
 	queuedDecision, err := srv.store.GetEconomyRewardDecision(ctx, "onboarding:initial:"+queuedV2User)
 	if err != nil {
@@ -387,11 +430,113 @@ func TestHistoricalInitialTokenTopupMigrationMintsLegacyUsersAndLeavesStateIntac
 	if err != nil {
 		t.Fatalf("get registration-only topup decision: %v", err)
 	}
-	if regOnlyDecision.Status != "applied" {
+	if regOnlyDecision.Status != "applied" || regOnlyDecision.Amount != srv.tokenPolicy().InitialToken-1000 {
 		t.Fatalf("registration-only topup decision should be applied: %+v", regOnlyDecision)
 	}
 	if _, err := srv.store.GetEconomyRewardDecision(ctx, "migration:onboarding:initial-topup:"+currentV2User); err == nil {
 		t.Fatalf("current v2 user should not receive historical topup")
+	}
+}
+
+func TestHistoricalInitialTokenTopupReconcileAddsDeltaForOlderLawUsers(t *testing.T) {
+	srv := newTestServer()
+	srv.cfg.TreasuryInitialToken = 0
+	ctx := context.Background()
+
+	ensureTestTianDaoLaw(t, srv, ctx, "legacy-v1", 1, 1000)
+	userID := "legacy-reconcile-user"
+	if _, err := srv.store.UpsertBot(ctx, store.BotUpsertInput{
+		BotID:       userID,
+		Name:        userID,
+		Provider:    "runtime",
+		Status:      "running",
+		Initialized: true,
+	}); err != nil {
+		t.Fatalf("upsert bot: %v", err)
+	}
+	if _, err := srv.store.CreateAgentRegistration(ctx, store.AgentRegistrationInput{
+		UserID:            userID,
+		RequestedUsername: userID,
+		GoodAt:            "migration",
+		Status:            "active",
+	}); err != nil {
+		t.Fatalf("create registration: %v", err)
+	}
+	if _, err := srv.store.Recharge(ctx, userID, 91000); err != nil {
+		t.Fatalf("seed balance after prior topup: %v", err)
+	}
+	appliedAt := time.Now().UTC()
+	if _, err := srv.store.UpsertEconomyRewardDecision(ctx, store.EconomyRewardDecision{
+		DecisionKey:     "migration:onboarding:initial-topup:" + userID,
+		RuleKey:         "migration.onboarding.initial_topup",
+		ResourceType:    "user",
+		ResourceID:      userID,
+		RecipientUserID: userID,
+		Amount:          90000,
+		Priority:        economy.RewardPriorityInitial,
+		Status:          "applied",
+		LedgerID:        1,
+		BalanceAfter:    91000,
+		CreatedAt:       appliedAt,
+		UpdatedAt:       appliedAt,
+		AppliedAt:       &appliedAt,
+	}); err != nil {
+		t.Fatalf("seed applied historical topup: %v", err)
+	}
+	if _, err := srv.putSettingJSON(ctx, initialTopupReconcileMigrationStateKey, tokenEconomyStoreMigrationState{}); err != nil {
+		t.Fatalf("reset reconcile migration marker: %v", err)
+	}
+
+	if err := srv.reconcileHistoricalInitialTokenTopups(ctx); err != nil {
+		t.Fatalf("reconcile historical initial topups: %v", err)
+	}
+	if err := srv.reconcileHistoricalInitialTokenTopups(ctx); err != nil {
+		t.Fatalf("re-run reconcile historical initial topups idempotently: %v", err)
+	}
+
+	if got := tokenBalanceForUser(t, srv, userID); got != srv.tokenPolicy().InitialToken {
+		t.Fatalf("reconciled user balance=%d want %d", got, srv.tokenPolicy().InitialToken)
+	}
+	reconcileDecision, err := srv.store.GetEconomyRewardDecision(ctx, "migration:onboarding:initial-topup-reconcile:"+userID)
+	if err != nil {
+		t.Fatalf("get reconcile decision: %v", err)
+	}
+	if reconcileDecision.Status != "applied" || reconcileDecision.Amount != 9000 {
+		t.Fatalf("unexpected reconcile decision: %+v", reconcileDecision)
+	}
+}
+
+func TestTreasurySeedMigrationRaisesExistingTreasuryToConfiguredFloorOnce(t *testing.T) {
+	srv := newTestServer()
+	ctx := context.Background()
+
+	account, err := srv.ensureTreasuryAccount(ctx)
+	if err != nil {
+		t.Fatalf("ensure initial treasury: %v", err)
+	}
+	if account.Balance > 25 {
+		if _, err := srv.store.Consume(ctx, clawTreasurySystemID, account.Balance-25); err != nil {
+			t.Fatalf("lower treasury before migration: %v", err)
+		}
+	}
+	srv.cfg.TreasuryInitialToken = 1000
+	if _, err := srv.putSettingJSON(ctx, treasurySeedMigrationStateKey, tokenEconomyStoreMigrationState{}); err != nil {
+		t.Fatalf("reset treasury seed migration marker: %v", err)
+	}
+
+	if err := srv.migrateTreasurySeedFloor(ctx); err != nil {
+		t.Fatalf("migrate treasury seed floor: %v", err)
+	}
+	if err := srv.migrateTreasurySeedFloor(ctx); err != nil {
+		t.Fatalf("re-run treasury seed floor idempotently: %v", err)
+	}
+
+	account, err = srv.ensureTreasuryAccount(ctx)
+	if err != nil {
+		t.Fatalf("get treasury after migration: %v", err)
+	}
+	if account.Balance != 1000 {
+		t.Fatalf("treasury balance=%d want 1000", account.Balance)
 	}
 }
 

@@ -16,19 +16,21 @@ import (
 )
 
 const (
-	storeMigrationStateKey        = "token_economy_v2_store_migration_complete"
-	initialTopupMigrationStateKey = "token_economy_v2_initial_token_topup_v2_complete"
-	ownerEconomyStateKey          = "token_economy_v2_owner_profiles"
-	commQuotaStateKey             = "token_economy_v2_comm_quota"
-	rewardDecisionStateKey        = "token_economy_v2_reward_decisions"
-	rewardQueueStateKey           = "token_economy_v2_reward_queue"
-	contributionEventStateKey     = "token_economy_v2_contribution_events"
-	knowledgeMetaStateKey         = "token_economy_v2_knowledge_meta"
-	toolEconomyStateKey           = "token_economy_v2_tool_meta"
-	dashboardEconomySnapshotKey   = "token_economy_v2_dashboard_snapshot"
+	storeMigrationStateKey                 = "token_economy_v2_store_migration_complete"
+	treasurySeedMigrationStateKey          = "token_economy_v2_treasury_seed_v1_complete"
+	initialTopupMigrationStateKey          = "token_economy_v2_initial_token_topup_v2_complete"
+	initialTopupReconcileMigrationStateKey = "token_economy_v2_initial_token_topup_reconcile_v1_complete"
+	ownerEconomyStateKey                   = "token_economy_v2_owner_profiles"
+	commQuotaStateKey                      = "token_economy_v2_comm_quota"
+	rewardDecisionStateKey                 = "token_economy_v2_reward_decisions"
+	rewardQueueStateKey                    = "token_economy_v2_reward_queue"
+	contributionEventStateKey              = "token_economy_v2_contribution_events"
+	knowledgeMetaStateKey                  = "token_economy_v2_knowledge_meta"
+	toolEconomyStateKey                    = "token_economy_v2_tool_meta"
+	dashboardEconomySnapshotKey            = "token_economy_v2_dashboard_snapshot"
 
 	onboardingSettlementMint         = "mint"
-	legacyInitialTokenGrant    int64 = 10000
+	legacyInitialTokenFallback int64 = 10000
 	githubBindOnboardingReward       = 50000
 	githubStarOnboardingReward       = 500000
 	githubForkOnboardingReward       = 200000
@@ -183,7 +185,13 @@ func (s *Server) initTokenEconomyV2(ctx context.Context) error {
 	if err := s.backfillOwnerEconomyProfiles(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateTreasurySeedFloor(ctx); err != nil {
+		return err
+	}
 	if err := s.migrateHistoricalInitialTokenTopups(ctx); err != nil {
+		return err
+	}
+	if err := s.reconcileHistoricalInitialTokenTopups(ctx); err != nil {
 		return err
 	}
 	return s.backfillProposalKnowledgeMeta(ctx)
@@ -466,6 +474,112 @@ func (s *Server) migrateTokenEconomyV2State(ctx context.Context) error {
 	return err
 }
 
+func (s *Server) migrateTreasurySeedFloor(ctx context.Context) error {
+	migrationState := tokenEconomyStoreMigrationState{}
+	if found, _, err := s.getSettingJSON(ctx, treasurySeedMigrationStateKey, &migrationState); err != nil {
+		return err
+	} else if found && migrationState.Completed {
+		return nil
+	}
+
+	account, err := s.ensureTreasuryAccount(ctx)
+	if err != nil {
+		return err
+	}
+	target := s.effectiveTreasuryInitialToken()
+	if target > account.Balance {
+		if _, err := s.store.Recharge(ctx, clawTreasurySystemID, target-account.Balance); err != nil {
+			return err
+		}
+	}
+	_, err = s.putSettingJSON(ctx, treasurySeedMigrationStateKey, tokenEconomyStoreMigrationState{
+		Completed: true,
+		UpdatedAt: time.Now().UTC(),
+	})
+	return err
+}
+
+func historicalClaimTime(reg store.AgentRegistration) time.Time {
+	if reg.ClaimedAt != nil && !reg.ClaimedAt.IsZero() {
+		return reg.ClaimedAt.UTC()
+	}
+	if reg.ActivatedAt != nil && !reg.ActivatedAt.IsZero() {
+		return reg.ActivatedAt.UTC()
+	}
+	return reg.CreatedAt.UTC()
+}
+
+func parseLawInitialToken(law store.TianDaoLaw) (int64, bool) {
+	raw := strings.TrimSpace(law.ManifestJSON)
+	if raw == "" {
+		return 0, false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return 0, false
+	}
+	n, ok := numericManifestValue(payload["initial_token"])
+	if !ok || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+func historicalInitialTokenForRegistration(reg store.AgentRegistration, laws []store.TianDaoLaw) (int64, string) {
+	if len(laws) == 0 {
+		return legacyInitialTokenFallback, ""
+	}
+	effectiveAt := historicalClaimTime(reg)
+	selected := laws[0]
+	for _, law := range laws {
+		if law.CreatedAt.After(effectiveAt) {
+			break
+		}
+		selected = law
+	}
+	if amount, ok := parseLawInitialToken(selected); ok {
+		return amount, selected.LawKey
+	}
+	return legacyInitialTokenFallback, selected.LawKey
+}
+
+func historicalInitialTopupTarget(currentInitial int64, reg store.AgentRegistration, laws []store.TianDaoLaw) (int64, int64, string) {
+	legacyInitial, lawKey := historicalInitialTokenForRegistration(reg, laws)
+	if legacyInitial < 0 {
+		legacyInitial = 0
+	}
+	if currentInitial <= legacyInitial {
+		return 0, legacyInitial, lawKey
+	}
+	return currentInitial - legacyInitial, legacyInitial, lawKey
+}
+
+func (s *Server) appliedHistoricalInitialTopupAmount(ctx context.Context, userID string) (int64, error) {
+	total := int64(0)
+	keys := []string{
+		fmt.Sprintf("migration:onboarding:initial-topup:%s", userID),
+		fmt.Sprintf("migration:onboarding:initial-topup-reconcile:%s", userID),
+	}
+	for _, key := range keys {
+		item, err := s.store.GetEconomyRewardDecision(ctx, key)
+		if err != nil {
+			if isEconomyRecordMissing(err) {
+				continue
+			}
+			return 0, err
+		}
+		if item.Status != "applied" {
+			continue
+		}
+		next, ok := safeInt64Add(total, item.Amount)
+		if !ok {
+			return 0, fmt.Errorf("historical initial topup overflow for %s", userID)
+		}
+		total = next
+	}
+	return total, nil
+}
+
 func (s *Server) migrateHistoricalInitialTokenTopups(ctx context.Context) error {
 	migrationState := tokenEconomyStoreMigrationState{}
 	if found, _, err := s.getSettingJSON(ctx, initialTopupMigrationStateKey, &migrationState); err != nil {
@@ -478,52 +592,146 @@ func (s *Server) migrateHistoricalInitialTokenTopups(ctx context.Context) error 
 		return err
 	}
 
-	topupAmount := s.tokenPolicy().InitialToken - legacyInitialTokenGrant
-	if topupAmount > 0 {
-		registrations, err := s.store.ListAgentRegistrations(ctx)
-		if err != nil {
+	laws, err := s.store.ListTianDaoLaws(ctx)
+	if err != nil {
+		return err
+	}
+	registrations, err := s.store.ListAgentRegistrations(ctx)
+	if err != nil {
+		return err
+	}
+	for _, reg := range registrations {
+		userID := strings.TrimSpace(reg.UserID)
+		if isExcludedTokenUserID(userID) {
+			continue
+		}
+		if reg.ActivatedAt == nil && reg.ClaimedAt == nil && !strings.EqualFold(strings.TrimSpace(reg.Status), "active") {
+			continue
+		}
+		if current, err := s.store.GetEconomyRewardDecision(ctx, fmt.Sprintf("onboarding:initial:%s", userID)); err == nil {
+			if current.Status == "applied" {
+				continue
+			}
+			if _, err := s.applyMintRewardDecision(ctx, fromStoreRewardDecision(current), true); err != nil {
+				return err
+			}
+			continue
+		} else if !isEconomyRecordMissing(err) {
 			return err
 		}
-		for _, reg := range registrations {
-			userID := strings.TrimSpace(reg.UserID)
-			if isExcludedTokenUserID(userID) {
+		if current, err := s.store.GetEconomyRewardDecision(ctx, fmt.Sprintf("migration:onboarding:initial-topup:%s", userID)); err == nil {
+			if current.Status == "applied" {
 				continue
 			}
-			if reg.ActivatedAt == nil && reg.ClaimedAt == nil && !strings.EqualFold(strings.TrimSpace(reg.Status), "active") {
-				continue
-			}
-			if current, err := s.store.GetEconomyRewardDecision(ctx, fmt.Sprintf("onboarding:initial:%s", userID)); err == nil {
-				if current.Status == "applied" {
-					continue
-				}
-				if _, err := s.applyMintRewardDecision(ctx, fromStoreRewardDecision(current), true); err != nil {
-					return err
-				}
-				continue
-			} else if !isEconomyRecordMissing(err) {
+			if _, err := s.applyMintRewardDecision(ctx, fromStoreRewardDecision(current), false); err != nil {
 				return err
 			}
-			if _, err := s.applyMintRewardDecision(ctx, economyRewardDecision{
-				DecisionKey:     fmt.Sprintf("migration:onboarding:initial-topup:%s", userID),
-				RuleKey:         "migration.onboarding.initial_topup",
-				ResourceType:    "user",
-				ResourceID:      userID,
-				RecipientUserID: userID,
-				Amount:          topupAmount,
-				Priority:        economy.RewardPriorityInitial,
-				Meta: map[string]any{
-					"user_id":              userID,
-					"legacy_initial_token": legacyInitialTokenGrant,
-					"target_initial_token": s.tokenPolicy().InitialToken,
-					"migration":            "historical_initial_topup",
-				},
-			}, false); err != nil {
-				return err
-			}
+			continue
+		} else if !isEconomyRecordMissing(err) {
+			return err
+		}
+
+		topupAmount, legacyInitial, lawKey := historicalInitialTopupTarget(s.tokenPolicy().InitialToken, reg, laws)
+		if topupAmount <= 0 {
+			continue
+		}
+		if _, err := s.applyMintRewardDecision(ctx, economyRewardDecision{
+			DecisionKey:     fmt.Sprintf("migration:onboarding:initial-topup:%s", userID),
+			RuleKey:         "migration.onboarding.initial_topup",
+			ResourceType:    "user",
+			ResourceID:      userID,
+			RecipientUserID: userID,
+			Amount:          topupAmount,
+			Priority:        economy.RewardPriorityInitial,
+			Meta: map[string]any{
+				"user_id":              userID,
+				"historical_law_key":   lawKey,
+				"legacy_initial_token": legacyInitial,
+				"target_initial_token": s.tokenPolicy().InitialToken,
+				"migration":            "historical_initial_topup",
+			},
+		}, false); err != nil {
+			return err
 		}
 	}
 
-	_, err := s.putSettingJSON(ctx, initialTopupMigrationStateKey, tokenEconomyStoreMigrationState{
+	_, err = s.putSettingJSON(ctx, initialTopupMigrationStateKey, tokenEconomyStoreMigrationState{
+		Completed: true,
+		UpdatedAt: time.Now().UTC(),
+	})
+	return err
+}
+
+func (s *Server) reconcileHistoricalInitialTokenTopups(ctx context.Context) error {
+	migrationState := tokenEconomyStoreMigrationState{}
+	if found, _, err := s.getSettingJSON(ctx, initialTopupReconcileMigrationStateKey, &migrationState); err != nil {
+		return err
+	} else if found && migrationState.Completed {
+		return nil
+	}
+
+	laws, err := s.store.ListTianDaoLaws(ctx)
+	if err != nil {
+		return err
+	}
+	registrations, err := s.store.ListAgentRegistrations(ctx)
+	if err != nil {
+		return err
+	}
+	for _, reg := range registrations {
+		userID := strings.TrimSpace(reg.UserID)
+		if isExcludedTokenUserID(userID) {
+			continue
+		}
+		if reg.ActivatedAt == nil && reg.ClaimedAt == nil && !strings.EqualFold(strings.TrimSpace(reg.Status), "active") {
+			continue
+		}
+		if current, err := s.store.GetEconomyRewardDecision(ctx, fmt.Sprintf("onboarding:initial:%s", userID)); err == nil {
+			if current.Status == "applied" {
+				continue
+			}
+			if _, err := s.applyMintRewardDecision(ctx, fromStoreRewardDecision(current), true); err != nil {
+				return err
+			}
+			continue
+		} else if !isEconomyRecordMissing(err) {
+			return err
+		}
+
+		desiredTopup, legacyInitial, lawKey := historicalInitialTopupTarget(s.tokenPolicy().InitialToken, reg, laws)
+		if desiredTopup <= 0 {
+			continue
+		}
+		appliedTopup, err := s.appliedHistoricalInitialTopupAmount(ctx, userID)
+		if err != nil {
+			return err
+		}
+		if appliedTopup >= desiredTopup {
+			continue
+		}
+		reconcileAmount := desiredTopup - appliedTopup
+		if _, err := s.applyMintRewardDecision(ctx, economyRewardDecision{
+			DecisionKey:     fmt.Sprintf("migration:onboarding:initial-topup-reconcile:%s", userID),
+			RuleKey:         "migration.onboarding.initial_topup_reconcile",
+			ResourceType:    "user",
+			ResourceID:      userID,
+			RecipientUserID: userID,
+			Amount:          reconcileAmount,
+			Priority:        economy.RewardPriorityInitial,
+			Meta: map[string]any{
+				"user_id":                userID,
+				"historical_law_key":     lawKey,
+				"legacy_initial_token":   legacyInitial,
+				"target_initial_token":   s.tokenPolicy().InitialToken,
+				"applied_historical_top": appliedTopup,
+				"migration":              "historical_initial_topup_reconcile",
+			},
+		}, false); err != nil {
+			return err
+		}
+	}
+
+	_, err = s.putSettingJSON(ctx, initialTopupReconcileMigrationStateKey, tokenEconomyStoreMigrationState{
 		Completed: true,
 		UpdatedAt: time.Now().UTC(),
 	})

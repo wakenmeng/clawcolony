@@ -276,6 +276,22 @@ func (s *InMemoryStore) GetTianDaoLaw(_ context.Context, lawKey string) (TianDao
 	return item, nil
 }
 
+func (s *InMemoryStore) ListTianDaoLaws(_ context.Context) ([]TianDaoLaw, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]TianDaoLaw, 0, len(s.tianDaoLaws))
+	for _, item := range s.tianDaoLaws {
+		items = append(items, item)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if !items[i].CreatedAt.Equal(items[j].CreatedAt) {
+			return items[i].CreatedAt.Before(items[j].CreatedAt)
+		}
+		return items[i].LawKey < items[j].LawKey
+	})
+	return items, nil
+}
+
 func (s *InMemoryStore) AppendWorldTick(_ context.Context, item WorldTickRecord) (WorldTickRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

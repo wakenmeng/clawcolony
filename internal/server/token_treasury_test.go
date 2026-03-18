@@ -34,10 +34,30 @@ func treasuryBalanceForTest(t *testing.T, srv *Server) int64 {
 	return account.Balance
 }
 
+func setTreasuryBalanceForTest(t *testing.T, srv *Server, amount int64) {
+	t.Helper()
+	ctx := context.Background()
+	account, err := srv.ensureTreasuryAccount(ctx)
+	if err != nil {
+		t.Fatalf("ensure treasury account: %v", err)
+	}
+	switch {
+	case account.Balance > amount:
+		if _, err := srv.store.Consume(ctx, clawTreasurySystemID, account.Balance-amount); err != nil {
+			t.Fatalf("lower treasury balance: %v", err)
+		}
+	case account.Balance < amount:
+		if _, err := srv.store.Recharge(ctx, clawTreasurySystemID, amount-account.Balance); err != nil {
+			t.Fatalf("raise treasury balance: %v", err)
+		}
+	}
+}
+
 func TestAPIColonyStatusIncludesTreasuryAndUptime(t *testing.T) {
 	srv := newTestServer()
 	srv.cfg.TreasuryInitialToken = 5000
 	ctx := context.Background()
+	setTreasuryBalanceForTest(t, srv, 5000)
 
 	_ = seedActiveUser(t, srv)
 	_ = seedActiveUser(t, srv)
@@ -233,6 +253,7 @@ func TestKBProposalApplyConsumesTreasury(t *testing.T) {
 	ctx := context.Background()
 	proposer := seedActiveUser(t, srv)
 	_, applierAPIKey := seedActiveUserWithAPIKey(t, srv)
+	setTreasuryBalanceForTest(t, srv, expectedReward+200)
 	if got := treasuryBalanceForTest(t, srv); got != expectedReward+200 {
 		t.Fatalf("initial treasury=%d want %d", got, expectedReward+200)
 	}
@@ -278,6 +299,7 @@ func TestTokenWishFulfillConsumesTreasury(t *testing.T) {
 	srv.cfg.TreasuryInitialToken = 25
 	userID, userAPIKey := seedActiveUserWithAPIKey(t, srv)
 	fulfillerUserID, fulfillerAPIKey := seedActiveUserWithAPIKey(t, srv)
+	setTreasuryBalanceForTest(t, srv, 25)
 	if got := treasuryBalanceForTest(t, srv); got != 25 {
 		t.Fatalf("initial treasury=%d want 25", got)
 	}
@@ -319,6 +341,7 @@ func TestTokenWishFulfillReturnsConflictWhenTreasuryInsufficient(t *testing.T) {
 	srv.cfg.TreasuryInitialToken = 5
 	userID, userAPIKey := seedActiveUserWithAPIKey(t, srv)
 	_, fulfillerAPIKey := seedActiveUserWithAPIKey(t, srv)
+	setTreasuryBalanceForTest(t, srv, 5)
 	if got := treasuryBalanceForTest(t, srv); got != 5 {
 		t.Fatalf("initial treasury=%d want 5", got)
 	}
@@ -397,6 +420,7 @@ func TestPiTaskSubmitRejectsWhenTreasuryInsufficient(t *testing.T) {
 	srv := newTestServer()
 	srv.cfg.TreasuryInitialToken = 1
 	userID := seedActiveUser(t, srv)
+	setTreasuryBalanceForTest(t, srv, 1)
 	if got := treasuryBalanceForTest(t, srv); got != 1 {
 		t.Fatalf("initial treasury=%d want 1", got)
 	}

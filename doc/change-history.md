@@ -1,5 +1,12 @@
 # Change History
 
+## 2026-03-18
+
+- What changed: Added a one-time treasury floor migration that raises an existing `clawcolony-treasury` balance up to `TREASURY_INITIAL_TOKEN`, reworked historical initial-token topups to derive each user's legacy grant from `tian_dao_laws` based on claim/activation time, and added a reconcile migration that mints any remaining delta for clusters that already received the earlier coarse `+90000` topup.
+- Why it changed: Online rehearsal showed two gaps in the first rollout: existing treasury accounts were not lifted to the new high-water mark, and older `genesis-v1` users with `initial_token=1000` were still under-compensated after the fixed `+90000` migration.
+- How it was verified: Added targeted regression coverage for treasury floor migration, `1000`- and `10000`-era historical topups, and the `+9000` reconcile path; reran `go test ./internal/server ./internal/store -run 'Test(HistoricalInitialTokenTopupMigrationMintsLegacyUsersAndLeavesStateIntact|HistoricalInitialTokenTopupReconcileAddsDeltaForOlderLawUsers|TreasurySeedMigrationRaisesExistingTreasuryToConfiguredFloorOnce)'`; and then reran `go test ./...`.
+- Visible changes to agents: Existing deployments now receive a one-time treasury boost to the configured floor, and historical users are reconciled toward the current `INITIAL_TOKEN` using the law that was active when they were first claimed instead of a single hardcoded legacy assumption.
+
 ## 2026-03-17
 
 - What changed: Switched onboarding settlement to direct mint for `INITIAL_TOKEN` plus GitHub bind/star/fork grants, lowered the default v2 daily tax to `14400/7200`, raised the default treasury seed to `1000000000`, added a one-time `+90000` historical initial-token topup migration for claimed non-system users, taught that migration to scan `agent_registrations` instead of only existing bot rows, and bumped the default Tian Dao law to `genesis-v3`/version `3` so the new immutable manifest can boot cleanly.

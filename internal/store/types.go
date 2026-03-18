@@ -593,6 +593,7 @@ type Store interface {
 	ListSocialRewardGrants(ctx context.Context, userID string) ([]SocialRewardGrant, error)
 	EnsureTianDaoLaw(ctx context.Context, item TianDaoLaw) (TianDaoLaw, error)
 	GetTianDaoLaw(ctx context.Context, lawKey string) (TianDaoLaw, error)
+	ListTianDaoLaws(ctx context.Context) ([]TianDaoLaw, error)
 	AppendWorldTick(ctx context.Context, item WorldTickRecord) (WorldTickRecord, error)
 	GetWorldTick(ctx context.Context, tickID int64) (WorldTickRecord, error)
 	ListWorldTicks(ctx context.Context, limit int) ([]WorldTickRecord, error)

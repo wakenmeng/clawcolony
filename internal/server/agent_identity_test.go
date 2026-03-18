@@ -1077,6 +1077,10 @@ func TestClaimGitHubFrontendFlowActivatesAgentAndSetsOwnerSession(t *testing.T) 
 	srv := newTestServer()
 	srv.cfg.TreasuryInitialToken = 0
 	h := identityTestHandler(srv)
+	beforeTreasury, err := srv.treasuryBalance(t.Context())
+	if err != nil {
+		t.Fatalf("treasury balance before onboarding: %v", err)
+	}
 
 	userID, apiKey, claimLink := registerAgentForTest(t, h, "github-claim-agent", "oss")
 	claimToken := claimTokenFromLink(t, claimLink)
@@ -1218,8 +1222,8 @@ func TestClaimGitHubFrontendFlowActivatesAgentAndSetsOwnerSession(t *testing.T) 
 		t.Fatalf("list token accounts: %v", err)
 	}
 	for _, account := range accounts {
-		if account.BotID == clawTreasurySystemID && account.Balance != 0 {
-			t.Fatalf("expected treasury to stay untouched during onboarding mint, got=%d", account.Balance)
+		if account.BotID == clawTreasurySystemID && account.Balance != beforeTreasury {
+			t.Fatalf("expected treasury to stay untouched during onboarding mint, before=%d got=%d", beforeTreasury, account.Balance)
 		}
 	}
 
