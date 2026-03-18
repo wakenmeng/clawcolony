@@ -616,6 +616,7 @@ type Store interface {
 	ListTokenAccounts(ctx context.Context) ([]TokenAccount, error)
 	Recharge(ctx context.Context, botID string, amount int64) (TokenLedger, error)
 	Consume(ctx context.Context, botID string, amount int64) (TokenLedger, error)
+	Transfer(ctx context.Context, fromBotID, toBotID string, amount int64) (TokenTransfer, error)
 	TransferWithFloor(ctx context.Context, fromBotID, toBotID string, amount int64) (TokenTransfer, error)
 	ListTokenLedger(ctx context.Context, botID string, limit int) ([]TokenLedger, error)
 	CreateCollabSession(ctx context.Context, item CollabSession) (CollabSession, error)

@@ -127,6 +127,71 @@ func TestTokenDrainTickCreditsTreasuryUnderV2(t *testing.T) {
 	}
 }
 
+func TestMailSendOverageCreditsTreasuryUnderV2(t *testing.T) {
+	srv := newTestServer()
+	srv.cfg.TreasuryInitialToken = 500
+	senderID, senderAPIKey := seedActiveUserWithAPIKey(t, srv)
+	recipientID := seedActiveUser(t, srv)
+	beforeSender := tokenBalanceForUser(t, srv, senderID)
+	beforeRecipient := tokenBalanceForUser(t, srv, recipientID)
+	beforeTreasury := treasuryBalanceForTest(t, srv)
+
+	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/mail/send", map[string]any{
+		"to_user_ids": []string{recipientID},
+		"body":        strings.Repeat("a", 50010),
+	}, apiKeyHeaders(senderAPIKey))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("mail send status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	afterSender := tokenBalanceForUser(t, srv, senderID)
+	afterRecipient := tokenBalanceForUser(t, srv, recipientID)
+	afterTreasury := treasuryBalanceForTest(t, srv)
+	if afterSender != beforeSender-10 {
+		t.Fatalf("sender balance=%d want %d", afterSender, beforeSender-10)
+	}
+	if afterRecipient != beforeRecipient {
+		t.Fatalf("recipient balance=%d want %d", afterRecipient, beforeRecipient)
+	}
+	if afterTreasury != beforeTreasury+10 {
+		t.Fatalf("treasury balance=%d want %d", afterTreasury, beforeTreasury+10)
+	}
+	if afterSender+afterRecipient+afterTreasury != beforeSender+beforeRecipient+beforeTreasury {
+		t.Fatalf("total supply changed before=%d after=%d", beforeSender+beforeRecipient+beforeTreasury, afterSender+afterRecipient+afterTreasury)
+	}
+}
+
+func TestMailSendOverageRejectsWhenSenderCannotCoverCharge(t *testing.T) {
+	srv := newTestServer()
+	srv.cfg.TreasuryInitialToken = 500
+	senderID, senderAPIKey := seedActiveUserWithAPIKey(t, srv)
+	recipientID := seedActiveUser(t, srv)
+	beforeSender := tokenBalanceForUser(t, srv, senderID)
+	beforeRecipient := tokenBalanceForUser(t, srv, recipientID)
+	beforeTreasury := treasuryBalanceForTest(t, srv)
+
+	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/mail/send", map[string]any{
+		"to_user_ids": []string{recipientID},
+		"body":        strings.Repeat("a", 51001),
+	}, apiKeyHeaders(senderAPIKey))
+	if w.Code != http.StatusPaymentRequired {
+		t.Fatalf("mail send insufficient status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	afterSender := tokenBalanceForUser(t, srv, senderID)
+	afterRecipient := tokenBalanceForUser(t, srv, recipientID)
+	afterTreasury := treasuryBalanceForTest(t, srv)
+	if afterSender != beforeSender {
+		t.Fatalf("sender balance=%d want %d", afterSender, beforeSender)
+	}
+	if afterRecipient != beforeRecipient {
+		t.Fatalf("recipient balance=%d want %d", afterRecipient, beforeRecipient)
+	}
+	if afterTreasury != beforeTreasury {
+		t.Fatalf("treasury balance=%d want %d", afterTreasury, beforeTreasury)
+	}
+}
+
 func TestTokenDrainTickContinuesAfterAtomicTransferFailure(t *testing.T) {
 	baseStore := store.NewInMemory()
 	failingStore := &failTransferStore{

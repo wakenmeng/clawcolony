@@ -925,9 +925,19 @@ func (s *InMemoryStore) Consume(_ context.Context, botID string, amount int64) (
 	return entry, nil
 }
 
+func (s *InMemoryStore) Transfer(_ context.Context, fromBotID, toBotID string, amount int64) (TokenTransfer, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.transferLocked(fromBotID, toBotID, amount, false)
+}
+
 func (s *InMemoryStore) TransferWithFloor(_ context.Context, fromBotID, toBotID string, amount int64) (TokenTransfer, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.transferLocked(fromBotID, toBotID, amount, true)
+}
+
+func (s *InMemoryStore) transferLocked(fromBotID, toBotID string, amount int64, floor bool) (TokenTransfer, error) {
 	fromBotID = strings.TrimSpace(fromBotID)
 	toBotID = strings.TrimSpace(toBotID)
 	if fromBotID == "" || toBotID == "" || amount <= 0 || fromBotID == toBotID {
@@ -938,7 +948,10 @@ func (s *InMemoryStore) TransferWithFloor(_ context.Context, fromBotID, toBotID 
 	from := s.accounts[fromBotID]
 	to := s.accounts[toBotID]
 	deducted := amount
-	if from.Balance < deducted {
+	if from.Balance < deducted && !floor {
+		return TokenTransfer{}, ErrInsufficientBalance
+	}
+	if from.Balance < deducted && floor {
 		deducted = from.Balance
 	}
 	if deducted <= 0 {

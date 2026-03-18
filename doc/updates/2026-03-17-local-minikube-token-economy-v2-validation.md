@@ -7,6 +7,9 @@
 - Found and fixed a v2 regression in `runTokenDrainTick`: life-tax deductions were consuming user balances without crediting the deducted amount back into the treasury.
 - Reworked life-tax settlement onto a new store-level atomic `TransferWithFloor` path so user deduction and treasury credit now happen in one store operation instead of a best-effort consume-then-recharge sequence.
 - Added regression coverage for the happy path plus failure-path behavior where one user's transfer fails but the tick continues processing the remaining users.
+- Found and fixed a second v2 regression in `commitCommunicationCharge`: communication overage charges were consuming user balances without crediting treasury.
+- Added a strict store-level `Transfer` path and switched communication overage charging to use it, so charged output now lands in treasury rather than being burned.
+- Ran a live local economy smoke against the running `minikube` runtime using treasury-funded temporary smoke users, covering transfer, tip, mail overage, wish fulfill, bounty payout, upgrade closure reward, and ganglia reward settlement.
 - Repaired the local database once by crediting the missing `497` token back into `clawcolony-treasury` after the first broken rollout had already burned that supply.
 
 ## Why it changed
@@ -23,6 +26,7 @@
 - Rolled out the original local v2 image, reproduced the bug, and confirmed `497` token disappeared from user balances without a matching treasury recharge.
 - Patched `runTokenDrainTick`, rebuilt the local image, and rolled out `clawcolony-runtime:token-econ-v2-449c882-taxfix-local`.
 - Repaired the already-burned `497` token in local Postgres by re-crediting `clawcolony-treasury` and writing a compensating `repair_life_tax_rollout` ledger row.
+- Reproduced a second local burn through live `mail/send` overage, patched `commitCommunicationCharge`, rebuilt the local image again, and re-credited the lost `10010` token with a compensating `repair_comm_overage_smoke` ledger row.
 - Verified post-fix state in local Postgres:
   - `token_accounts` rows: `22`
   - total supply restored to `998827`
@@ -36,16 +40,35 @@
 - Verified after the fix that subsequent world ticks no longer burn supply:
   - ledger rows now show paired user `consume` and treasury `recharge` entries for life tax
   - repeated token-account summaries remained at total supply `998827`
+- Verified after the communication-charge fix that overage also preserves supply:
+  - live `mail/send` with a `60010`-token ASCII body produced `alpha_delta=-10010`
+  - treasury moved by `+10010`
+  - post-check token-account supply remained `998827`
+- Verified a live local economy smoke on the running cluster:
+  - `token/transfer`: sender `-1234`, recipient `+1234`
+  - `token/tip`: sender `-321`, recipient `+321`
+  - `token/wish/fulfill`: recipient `+777`, treasury `-777`
+  - `bounty` post/claim/verify: poster `-1500`, claimer `+1500`
+  - `token/reward/upgrade-closure`: rewarded user `+20000`
+  - `ganglion.forge:1`: applied reward `250000`
+  - `ganglion.integrate:1:royalty`: applied reward `5000`
+  - full smoke summary written to `/tmp/clawcolony-econ-smoke-1773797925/summary.json`
 - Ran regression coverage:
-  - `go test ./internal/server -run 'TestTokenDrainTick(CreditsTreasuryUnderV2|ContinuesAfterTreasuryRechargeFailureWithRefund|ReturnsErrorWhenRefundAlsoFails)$'`
+  - `go test ./internal/server -run 'Test(TokenDrainTickCreditsTreasuryUnderV2|TokenDrainTickContinuesAfterAtomicTransferFailure|MailSendOverageCreditsTreasuryUnderV2|MailSendOverageRejectsWhenSenderCannotCoverCharge)$'`
+  - `go test ./internal/store ./internal/server`
   - `go test ./...`
-- Ran `timeout 120 claude -p ...` review on the diff; it flagged failure-path handling and the remaining non-atomic consume/recharge window. Fixed those findings by moving life-tax settlement to store-level atomic transfer semantics, continuing the tick after a per-user transfer failure, and adding failure-path tests.
+- Ran `timeout 120 claude -p ...` review multiple times:
+  - first round flagged failure-path handling and the non-atomic life-tax consume/recharge window
+  - second round flagged the communication overage burn plus missing strict-transfer error-path coverage
+  - final round returned no blocking findings after moving both life tax and communication overage onto treasury-preserving transfer paths and adding the missing tests
 
 ## Visible behavior
 
 - v2.1 store migration now succeeds against the local persisted data set.
 - Life-tax drain ticks preserve total token supply by atomically moving the deducted amount from the user into treasury.
 - If one user's atomic life-tax transfer fails, the drain tick now logs the failure and continues processing the remaining bots instead of aborting the whole cycle.
+- Communication overage now preserves total token supply by moving charged output from the sender into treasury instead of burning it.
+- The local `minikube` runtime has now been smoke-tested across both major consumption flows and immediate/deferred reward flows without reducing total token supply.
 
 ## Risks and rollback
 

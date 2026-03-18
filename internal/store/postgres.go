@@ -1822,7 +1822,15 @@ func (s *PostgresStore) Consume(ctx context.Context, botID string, amount int64)
 	return entry, nil
 }
 
+func (s *PostgresStore) Transfer(ctx context.Context, fromBotID, toBotID string, amount int64) (TokenTransfer, error) {
+	return s.transfer(ctx, fromBotID, toBotID, amount, false)
+}
+
 func (s *PostgresStore) TransferWithFloor(ctx context.Context, fromBotID, toBotID string, amount int64) (TokenTransfer, error) {
+	return s.transfer(ctx, fromBotID, toBotID, amount, true)
+}
+
+func (s *PostgresStore) transfer(ctx context.Context, fromBotID, toBotID string, amount int64, floor bool) (TokenTransfer, error) {
 	fromBotID = strings.TrimSpace(fromBotID)
 	toBotID = strings.TrimSpace(toBotID)
 	if fromBotID == "" || toBotID == "" || amount <= 0 || fromBotID == toBotID {
@@ -1850,7 +1858,10 @@ func (s *PostgresStore) TransferWithFloor(ctx context.Context, fromBotID, toBotI
 		balances[id] = balance
 	}
 	deducted := amount
-	if balances[fromBotID] < deducted {
+	if balances[fromBotID] < deducted && !floor {
+		return TokenTransfer{}, ErrInsufficientBalance
+	}
+	if balances[fromBotID] < deducted && floor {
 		deducted = balances[fromBotID]
 	}
 	if deducted <= 0 {

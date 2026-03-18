@@ -1081,10 +1081,11 @@ func (s *Server) commitCommunicationCharge(ctx context.Context, preview commChar
 	}
 	var ledger store.TokenLedger
 	if preview.ChargedAmount > 0 {
-		ledger, err = s.store.Consume(ctx, preview.UserID, preview.ChargedAmount)
+		transfer, err := s.store.Transfer(ctx, preview.UserID, clawTreasurySystemID, preview.ChargedAmount)
 		if err != nil {
 			return err
 		}
+		ledger = transfer.FromLedger
 	}
 	if meta == nil {
 		meta = map[string]any{}
