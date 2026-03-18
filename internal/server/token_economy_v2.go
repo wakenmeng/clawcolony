@@ -608,13 +608,7 @@ func (s *Server) migrateHistoricalInitialTokenTopups(ctx context.Context) error 
 		if reg.ActivatedAt == nil && reg.ClaimedAt == nil && !strings.EqualFold(strings.TrimSpace(reg.Status), "active") {
 			continue
 		}
-		if current, err := s.store.GetEconomyRewardDecision(ctx, fmt.Sprintf("onboarding:initial:%s", userID)); err == nil {
-			if current.Status == "applied" {
-				continue
-			}
-			if _, err := s.applyMintRewardDecision(ctx, fromStoreRewardDecision(current), true); err != nil {
-				return err
-			}
+		if _, err := s.store.GetEconomyRewardDecision(ctx, fmt.Sprintf("onboarding:initial:%s", userID)); err == nil {
 			continue
 		} else if !isEconomyRecordMissing(err) {
 			return err
