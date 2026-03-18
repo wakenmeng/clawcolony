@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -1819,6 +1820,77 @@ func (s *PostgresStore) Consume(ctx context.Context, botID string, amount int64)
 		return TokenLedger{}, err
 	}
 	return entry, nil
+}
+
+func (s *PostgresStore) TransferWithFloor(ctx context.Context, fromBotID, toBotID string, amount int64) (TokenTransfer, error) {
+	fromBotID = strings.TrimSpace(fromBotID)
+	toBotID = strings.TrimSpace(toBotID)
+	if fromBotID == "" || toBotID == "" || amount <= 0 || fromBotID == toBotID {
+		return TokenTransfer{}, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return TokenTransfer{}, err
+	}
+	defer tx.Rollback()
+	if err := s.ensureBotTx(ctx, tx, fromBotID); err != nil {
+		return TokenTransfer{}, err
+	}
+	if err := s.ensureBotTx(ctx, tx, toBotID); err != nil {
+		return TokenTransfer{}, err
+	}
+	ids := []string{fromBotID, toBotID}
+	sort.Strings(ids)
+	balances := map[string]int64{}
+	for _, id := range ids {
+		var balance int64
+		if err := tx.QueryRowContext(ctx, `SELECT balance FROM token_accounts WHERE user_id = $1 FOR UPDATE`, id).Scan(&balance); err != nil {
+			return TokenTransfer{}, err
+		}
+		balances[id] = balance
+	}
+	deducted := amount
+	if balances[fromBotID] < deducted {
+		deducted = balances[fromBotID]
+	}
+	if deducted <= 0 {
+		if err := tx.Commit(); err != nil {
+			return TokenTransfer{}, err
+		}
+		return TokenTransfer{}, nil
+	}
+	fromBalance := balances[fromBotID] - deducted
+	toBalance := balances[toBotID]
+	if toBalance > (math.MaxInt64 - deducted) {
+		return TokenTransfer{}, ErrBalanceOverflow
+	}
+	toBalance += deducted
+	if _, err := tx.ExecContext(ctx, `UPDATE token_accounts SET balance = $2, updated_at = NOW() WHERE user_id = $1`, fromBotID, fromBalance); err != nil {
+		return TokenTransfer{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE token_accounts SET balance = $2, updated_at = NOW() WHERE user_id = $1`, toBotID, toBalance); err != nil {
+		return TokenTransfer{}, err
+	}
+	var fromEntry TokenLedger
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO token_ledger(user_id, op_type, amount, balance_after)
+		VALUES($1, 'consume', $2, $3)
+		RETURNING id, user_id, op_type, amount, balance_after, created_at
+	`, fromBotID, deducted, fromBalance).Scan(&fromEntry.ID, &fromEntry.BotID, &fromEntry.OpType, &fromEntry.Amount, &fromEntry.BalanceAfter, &fromEntry.CreatedAt); err != nil {
+		return TokenTransfer{}, err
+	}
+	var toEntry TokenLedger
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO token_ledger(user_id, op_type, amount, balance_after)
+		VALUES($1, 'recharge', $2, $3)
+		RETURNING id, user_id, op_type, amount, balance_after, created_at
+	`, toBotID, deducted, toBalance).Scan(&toEntry.ID, &toEntry.BotID, &toEntry.OpType, &toEntry.Amount, &toEntry.BalanceAfter, &toEntry.CreatedAt); err != nil {
+		return TokenTransfer{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return TokenTransfer{}, err
+	}
+	return TokenTransfer{Deducted: deducted, FromLedger: fromEntry, ToLedger: toEntry}, nil
 }
 
 func (s *PostgresStore) ListTokenLedger(ctx context.Context, botID string, limit int) ([]TokenLedger, error) {

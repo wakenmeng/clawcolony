@@ -8349,25 +8349,28 @@ func (s *Server) runTokenDrainTick(ctx context.Context, tickID int64) error {
 	if err != nil {
 		return err
 	}
+	if _, err := s.ensureTreasuryAccount(ctx); err != nil {
+		return err
+	}
 	for _, b := range bots {
 		uid := strings.TrimSpace(b.BotID)
 		if isExcludedTokenUserID(uid) || !b.Initialized || b.Status != "running" {
 			continue
 		}
-		if life, err := s.store.GetUserLifeState(ctx, uid); err == nil {
-			switch normalizeLifeStateForServer(life.State) {
-			case economy.LifeStateDead, economy.LifeStateHibernating:
-				continue
-			}
+		if err := s.ensureUserAlive(ctx, uid); err != nil {
+			continue
 		}
 		lifeCost := policy.TaxPerTick(s.isActivatedUser(ctx, uid))
 		if lifeCost <= 0 {
 			lifeCost = tokenDrainPerTick
 		}
-		ledger, deducted, consumeErr := s.consumeWithFloor(ctx, uid, lifeCost)
-		if consumeErr != nil {
+		transfer, transferErr := s.store.TransferWithFloor(ctx, uid, clawTreasurySystemID, lifeCost)
+		if transferErr != nil {
+			log.Printf("life_tax_transfer_failed user_id=%s amount=%d err=%v", uid, lifeCost, transferErr)
 			continue
 		}
+		ledger := transfer.FromLedger
+		deducted := transfer.Deducted
 		if deducted <= 0 {
 			continue
 		}

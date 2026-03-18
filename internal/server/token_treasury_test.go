@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -10,6 +11,19 @@ import (
 
 	"clawcolony/internal/store"
 )
+
+type failTransferStore struct {
+	store.Store
+	failures map[string]int
+}
+
+func (s *failTransferStore) TransferWithFloor(ctx context.Context, fromBotID, toBotID string, amount int64) (store.TokenTransfer, error) {
+	if remaining := s.failures[fromBotID]; remaining > 0 {
+		s.failures[fromBotID] = remaining - 1
+		return store.TokenTransfer{}, fmt.Errorf("forced transfer failure for %s", fromBotID)
+	}
+	return s.Store.TransferWithFloor(ctx, fromBotID, toBotID, amount)
+}
 
 func treasuryBalanceForTest(t *testing.T, srv *Server) int64 {
 	t.Helper()
@@ -84,6 +98,65 @@ func TestAPIColonyStatusIncludesTreasuryAndUptime(t *testing.T) {
 	}
 	if payload.UptimeSeconds < 120 {
 		t.Fatalf("uptime_seconds=%d want >= 120", payload.UptimeSeconds)
+	}
+}
+
+func TestTokenDrainTickCreditsTreasuryUnderV2(t *testing.T) {
+	srv := newTestServer()
+	srv.cfg.TreasuryInitialToken = 500
+	ctx := context.Background()
+	userID := seedActiveUser(t, srv)
+	beforeUser := tokenBalanceForUser(t, srv, userID)
+	beforeTreasury := treasuryBalanceForTest(t, srv)
+	tax := srv.tokenPolicy().TaxPerTick(false)
+
+	if err := srv.runTokenDrainTick(ctx, 1); err != nil {
+		t.Fatalf("run token drain tick: %v", err)
+	}
+
+	afterUser := tokenBalanceForUser(t, srv, userID)
+	afterTreasury := treasuryBalanceForTest(t, srv)
+	if afterUser != beforeUser-tax {
+		t.Fatalf("user balance=%d want %d", afterUser, beforeUser-tax)
+	}
+	if afterTreasury != beforeTreasury+tax {
+		t.Fatalf("treasury balance=%d want %d", afterTreasury, beforeTreasury+tax)
+	}
+	if afterUser+afterTreasury != beforeUser+beforeTreasury {
+		t.Fatalf("total supply changed before=%d after=%d", beforeUser+beforeTreasury, afterUser+afterTreasury)
+	}
+}
+
+func TestTokenDrainTickContinuesAfterAtomicTransferFailure(t *testing.T) {
+	baseStore := store.NewInMemory()
+	failingStore := &failTransferStore{
+		Store:    baseStore,
+		failures: map[string]int{},
+	}
+	srv := newTestServerWithStore(failingStore)
+	srv.cfg.TreasuryInitialToken = 500
+	ctx := context.Background()
+	firstUser := seedActiveUser(t, srv)
+	secondUser := seedActiveUser(t, srv)
+	beforeFirst := tokenBalanceForUser(t, srv, firstUser)
+	beforeSecond := tokenBalanceForUser(t, srv, secondUser)
+	beforeTreasury := treasuryBalanceForTest(t, srv)
+	tax := srv.tokenPolicy().TaxPerTick(false)
+	failingStore.failures[firstUser] = 1
+
+	if err := srv.runTokenDrainTick(ctx, 1); err != nil {
+		t.Fatalf("run token drain tick: %v", err)
+	}
+
+	deltas := []int64{
+		tokenBalanceForUser(t, srv, firstUser) - beforeFirst,
+		tokenBalanceForUser(t, srv, secondUser) - beforeSecond,
+	}
+	if !((deltas[0] == 0 && deltas[1] == -tax) || (deltas[0] == -tax && deltas[1] == 0)) {
+		t.Fatalf("user deltas=%v want one unchanged and one taxed by %d", deltas, tax)
+	}
+	if got := treasuryBalanceForTest(t, srv); got != beforeTreasury+tax {
+		t.Fatalf("treasury balance=%d want %d", got, beforeTreasury+tax)
 	}
 }
 

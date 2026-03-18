@@ -110,6 +110,12 @@ type TokenLedger struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
+type TokenTransfer struct {
+	Deducted   int64       `json:"deducted"`
+	FromLedger TokenLedger `json:"from_ledger"`
+	ToLedger   TokenLedger `json:"to_ledger"`
+}
+
 type CollabSession struct {
 	CollabID            string     `json:"collab_id"`
 	Title               string     `json:"title"`
@@ -610,6 +616,7 @@ type Store interface {
 	ListTokenAccounts(ctx context.Context) ([]TokenAccount, error)
 	Recharge(ctx context.Context, botID string, amount int64) (TokenLedger, error)
 	Consume(ctx context.Context, botID string, amount int64) (TokenLedger, error)
+	TransferWithFloor(ctx context.Context, fromBotID, toBotID string, amount int64) (TokenTransfer, error)
 	ListTokenLedger(ctx context.Context, botID string, limit int) ([]TokenLedger, error)
 	CreateCollabSession(ctx context.Context, item CollabSession) (CollabSession, error)
 	GetCollabSession(ctx context.Context, collabID string) (CollabSession, error)

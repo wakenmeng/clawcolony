@@ -925,6 +925,58 @@ func (s *InMemoryStore) Consume(_ context.Context, botID string, amount int64) (
 	return entry, nil
 }
 
+func (s *InMemoryStore) TransferWithFloor(_ context.Context, fromBotID, toBotID string, amount int64) (TokenTransfer, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fromBotID = strings.TrimSpace(fromBotID)
+	toBotID = strings.TrimSpace(toBotID)
+	if fromBotID == "" || toBotID == "" || amount <= 0 || fromBotID == toBotID {
+		return TokenTransfer{}, nil
+	}
+	s.ensureBot(fromBotID)
+	s.ensureBot(toBotID)
+	from := s.accounts[fromBotID]
+	to := s.accounts[toBotID]
+	deducted := amount
+	if from.Balance < deducted {
+		deducted = from.Balance
+	}
+	if deducted <= 0 {
+		return TokenTransfer{}, nil
+	}
+	if deducted > 0 && to.Balance > (math.MaxInt64-deducted) {
+		return TokenTransfer{}, ErrBalanceOverflow
+	}
+	from.Balance -= deducted
+	from.UpdatedAt = time.Now().UTC()
+	s.accounts[fromBotID] = from
+	s.nextLedgerID++
+	fromEntry := TokenLedger{
+		ID:           s.nextLedgerID,
+		BotID:        fromBotID,
+		OpType:       "consume",
+		Amount:       deducted,
+		BalanceAfter: from.Balance,
+		CreatedAt:    time.Now().UTC(),
+	}
+	s.ledger = append(s.ledger, fromEntry)
+
+	to.Balance += deducted
+	to.UpdatedAt = time.Now().UTC()
+	s.accounts[toBotID] = to
+	s.nextLedgerID++
+	toEntry := TokenLedger{
+		ID:           s.nextLedgerID,
+		BotID:        toBotID,
+		OpType:       "recharge",
+		Amount:       deducted,
+		BalanceAfter: to.Balance,
+		CreatedAt:    time.Now().UTC(),
+	}
+	s.ledger = append(s.ledger, toEntry)
+	return TokenTransfer{Deducted: deducted, FromLedger: fromEntry, ToLedger: toEntry}, nil
+}
+
 func (s *InMemoryStore) ListTokenLedger(_ context.Context, botID string, limit int) ([]TokenLedger, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
