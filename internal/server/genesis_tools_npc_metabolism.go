@@ -312,16 +312,22 @@ func (s *Server) handleToolReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	genesisStateMu.Lock()
-	defer genesisStateMu.Unlock()
 	state, err := s.getToolRegistryState(r.Context())
 	if err != nil {
+		genesisStateMu.Unlock()
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	var (
+		found        bool
+		updatedItem  toolRegistryItem
+		authorUserID string
+	)
 	for i := range state.Items {
 		if state.Items[i].ToolID != req.ToolID {
 			continue
 		}
+		found = true
 		now := time.Now().UTC()
 		state.Items[i].ReviewedBy = reviewerUserID
 		state.Items[i].ReviewNote = req.ReviewNote
@@ -334,67 +340,75 @@ func (s *Server) handleToolReview(w http.ResponseWriter, r *http.Request) {
 			state.Items[i].RejectedAt = &now
 		}
 		if err := s.saveToolRegistryState(r.Context(), state); err != nil {
+			genesisStateMu.Unlock()
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		meta, _, _ := s.toolEconomyMetaForID(r.Context(), req.ToolID)
-		meta.ToolID = req.ToolID
-		if strings.TrimSpace(meta.AuthorUserID) == "" {
-			meta.AuthorUserID = strings.TrimSpace(state.Items[i].AuthorUserID)
-		}
-		if meta.PriceToken <= 0 {
-			meta.PriceToken = parseToolManifestPrice(state.Items[i].Manifest)
-		}
-		if req.FunctionalClusterKey != "" {
-			meta.FunctionalClusterKey = req.FunctionalClusterKey
-		}
-		_ = s.upsertToolEconomyMeta(r.Context(), meta)
-		if req.Decision == "approve" {
-			if req.FunctionalClusterKey == "" {
-				now := time.Now().UTC()
-				_, _ = s.store.UpsertEconomyRewardDecision(r.Context(), store.EconomyRewardDecision{
-					DecisionKey:     fmt.Sprintf("tool.approve.pending:%s", req.ToolID),
-					RuleKey:         "tool.approve",
-					ResourceType:    "tool",
-					ResourceID:      req.ToolID,
-					RecipientUserID: strings.TrimSpace(state.Items[i].AuthorUserID),
-					Status:          "pending_review",
-					QueueReason:     "functional_cluster_key_required",
-					CreatedAt:       now,
-					UpdatedAt:       now,
-					MetaJSON:        mustMarshalJSON(map[string]any{"tool_id": req.ToolID}),
-				})
-			} else {
-				_, _, _ = s.appendContributionEvent(r.Context(), contributionEvent{
-					EventKey:     fmt.Sprintf("tool.approve:%s", req.ToolID),
-					Kind:         "tool.approve",
-					UserID:       strings.TrimSpace(state.Items[i].AuthorUserID),
-					ResourceType: "tool",
-					ResourceID:   req.ToolID,
-					Meta: map[string]any{
-						"tool_id":                req.ToolID,
-						"tier":                   state.Items[i].Tier,
-						"reviewer_user_id":       reviewerUserID,
-						"functional_cluster_key": req.FunctionalClusterKey,
-					},
-				})
-				_, _, _ = s.appendContributionEvent(r.Context(), contributionEvent{
-					EventKey:     fmt.Sprintf("community.review.tool:%s:%s", req.ToolID, reviewerUserID),
-					Kind:         "community.review.tool",
-					UserID:       reviewerUserID,
-					ResourceType: "tool",
-					ResourceID:   req.ToolID,
-					Meta: map[string]any{
-						"tool_id":          req.ToolID,
-						"reviewer_user_id": reviewerUserID,
-					},
-				})
-			}
-		}
-		writeJSON(w, http.StatusAccepted, map[string]any{"item": state.Items[i]})
+		updatedItem = state.Items[i]
+		authorUserID = strings.TrimSpace(state.Items[i].AuthorUserID)
+		break
+	}
+	genesisStateMu.Unlock()
+	if !found {
+		writeError(w, http.StatusNotFound, "tool not found")
 		return
 	}
-	writeError(w, http.StatusNotFound, "tool not found")
+	meta, _, _ := s.toolEconomyMetaForID(r.Context(), req.ToolID)
+	meta.ToolID = req.ToolID
+	if strings.TrimSpace(meta.AuthorUserID) == "" {
+		meta.AuthorUserID = authorUserID
+	}
+	if meta.PriceToken <= 0 {
+		meta.PriceToken = parseToolManifestPrice(updatedItem.Manifest)
+	}
+	if req.FunctionalClusterKey != "" {
+		meta.FunctionalClusterKey = req.FunctionalClusterKey
+	}
+	_ = s.upsertToolEconomyMeta(r.Context(), meta)
+	if req.Decision == "approve" {
+		if req.FunctionalClusterKey == "" {
+			now := time.Now().UTC()
+			_, _ = s.store.UpsertEconomyRewardDecision(r.Context(), store.EconomyRewardDecision{
+				DecisionKey:     fmt.Sprintf("tool.approve.pending:%s", req.ToolID),
+				RuleKey:         "tool.approve",
+				ResourceType:    "tool",
+				ResourceID:      req.ToolID,
+				RecipientUserID: authorUserID,
+				Status:          "pending_review",
+				QueueReason:     "functional_cluster_key_required",
+				CreatedAt:       now,
+				UpdatedAt:       now,
+				MetaJSON:        mustMarshalJSON(map[string]any{"tool_id": req.ToolID}),
+			})
+		} else {
+			_, _, _ = s.appendContributionEvent(r.Context(), contributionEvent{
+				EventKey:     fmt.Sprintf("tool.approve:%s", req.ToolID),
+				Kind:         "tool.approve",
+				UserID:       authorUserID,
+				ResourceType: "tool",
+				ResourceID:   req.ToolID,
+				Meta: map[string]any{
+					"tool_id":                req.ToolID,
+					"tier":                   updatedItem.Tier,
+					"reviewer_user_id":       reviewerUserID,
+					"functional_cluster_key": req.FunctionalClusterKey,
+				},
+			})
+			_, _, _ = s.appendContributionEvent(r.Context(), contributionEvent{
+				EventKey:     fmt.Sprintf("community.review.tool:%s:%s", req.ToolID, reviewerUserID),
+				Kind:         "community.review.tool",
+				UserID:       reviewerUserID,
+				ResourceType: "tool",
+				ResourceID:   req.ToolID,
+				Meta: map[string]any{
+					"tool_id":          req.ToolID,
+					"reviewer_user_id": reviewerUserID,
+				},
+			})
+		}
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"item": updatedItem})
+	return
 }
 
 func (s *Server) handleToolSearch(w http.ResponseWriter, r *http.Request) {

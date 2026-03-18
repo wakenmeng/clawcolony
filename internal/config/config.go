@@ -29,6 +29,14 @@ type Config struct {
 	GitHubOAuthAuthorizeURL            string
 	GitHubOAuthTokenURL                string
 	GitHubOAuthUserInfoURL             string
+	GitHubAPIMockEnabled               bool
+	GitHubAPIMockAllowUnsafeLocal      bool
+	GitHubAPIMockLogin                 string
+	GitHubAPIMockName                  string
+	GitHubAPIMockEmail                 string
+	GitHubAPIMockUserID                int64
+	GitHubAPIMockStarred               bool
+	GitHubAPIMockForked                bool
 	ColonyRepoURL                      string
 	ColonyRepoBranch                   string
 	ColonyRepoLocalPath                string
@@ -118,6 +126,14 @@ func FromEnv() Config {
 		GitHubOAuthAuthorizeURL:            getEnv("CLAWCOLONY_GITHUB_OAUTH_AUTHORIZE_URL", ""),
 		GitHubOAuthTokenURL:                getEnv("CLAWCOLONY_GITHUB_OAUTH_TOKEN_URL", ""),
 		GitHubOAuthUserInfoURL:             getEnv("CLAWCOLONY_GITHUB_OAUTH_USERINFO_URL", ""),
+		GitHubAPIMockEnabled:               getEnvBool("GITHUB_API_MOCK_ENABLED", false),
+		GitHubAPIMockAllowUnsafeLocal:      getEnvBool("GITHUB_API_MOCK_ALLOW_UNSAFE_LOCAL", false),
+		GitHubAPIMockLogin:                 getEnv("GITHUB_API_MOCK_LOGIN", getEnv("GITHUB_API_MOCK_MACHINE_USER", "octo")),
+		GitHubAPIMockName:                  getEnv("GITHUB_API_MOCK_NAME", "Octo Human"),
+		GitHubAPIMockEmail:                 getEnv("GITHUB_API_MOCK_EMAIL", ""),
+		GitHubAPIMockUserID:                getEnvInt64("GITHUB_API_MOCK_USER_ID", 42),
+		GitHubAPIMockStarred:               getEnvBool("GITHUB_API_MOCK_STARRED", true),
+		GitHubAPIMockForked:                getEnvBool("GITHUB_API_MOCK_FORKED", true),
 		ColonyRepoURL:                      getEnv("COLONY_REPO_URL", ""),
 		ColonyRepoBranch:                   getEnv("COLONY_REPO_BRANCH", "main"),
 		ColonyRepoLocalPath:                getEnv("COLONY_REPO_LOCAL_PATH", "/tmp/clawcolony-civilization-repo"),

@@ -1155,6 +1155,187 @@ func TestClaimGitHubFrontendFlowActivatesAgentAndSetsOwnerSession(t *testing.T) 
 	}
 }
 
+func TestClaimGitHubFrontendFlowUsesLocalGitHubMock(t *testing.T) {
+	t.Setenv("GITHUB_API_MOCK_ENABLED", "true")
+	t.Setenv("GITHUB_API_MOCK_ALLOW_UNSAFE_LOCAL", "true")
+	t.Setenv("GITHUB_API_MOCK_LOGIN", "mock-octo")
+	t.Setenv("GITHUB_API_MOCK_NAME", "Mock Octo")
+	t.Setenv("GITHUB_API_MOCK_EMAIL", "mock-octo@example.com")
+	t.Setenv("GITHUB_API_MOCK_USER_ID", "4242")
+	t.Setenv("GITHUB_API_MOCK_STARRED", "true")
+	t.Setenv("GITHUB_API_MOCK_FORKED", "true")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_ID", "gh-client")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_SECRET", "gh-secret")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_AUTHORIZE_URL", "https://github.mock.test/login/oauth/authorize")
+
+	srv := newTestServer()
+	h := identityTestHandler(srv)
+
+	userID, apiKey, claimLink := registerAgentForTest(t, h, "github-mock-agent", "oss")
+	claimToken := claimTokenFromLink(t, claimLink)
+
+	start := doJSONRequest(t, h, http.MethodPost, "/api/v1/claims/github/start", map[string]any{
+		"claim_token": claimToken,
+	})
+	if start.Code != http.StatusAccepted {
+		t.Fatalf("claim github start status=%d body=%s", start.Code, start.Body.String())
+	}
+	startBody := parseJSONBody(t, start)
+	rawAuthorizeURL, _ := startBody["authorize_url"].(string)
+	if strings.TrimSpace(rawAuthorizeURL) == "" {
+		t.Fatalf("missing authorize_url in start response: %s", start.Body.String())
+	}
+	authorizeURL, err := neturl.Parse(rawAuthorizeURL)
+	if err != nil {
+		t.Fatalf("parse authorize_url: %v", err)
+	}
+	state := authorizeURL.Query().Get("state")
+	if strings.TrimSpace(state) == "" {
+		t.Fatalf("expected signed oauth state in authorize url")
+	}
+
+	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/claim/callback?code=gh-code&state="+neturl.QueryEscape(state), nil)
+	callbackReq.Header.Set("Cookie", joinCookieHeader("", start.Result().Cookies()))
+	callback := httptest.NewRecorder()
+	h.ServeHTTP(callback, callbackReq)
+	if callback.Code != http.StatusSeeOther {
+		t.Fatalf("claim github callback status=%d body=%s", callback.Code, callback.Body.String())
+	}
+	callbackLocation, err := neturl.Parse(callback.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("callback location: %v", err)
+	}
+	if got := callbackLocation.Query().Get("github_username"); got != "mock-octo" {
+		t.Fatalf("unexpected callback github username=%q", got)
+	}
+	if got := callbackLocation.Query().Get("starred"); got != "true" {
+		t.Fatalf("unexpected callback starred flag=%q", got)
+	}
+	if got := callbackLocation.Query().Get("forked"); got != "true" {
+		t.Fatalf("unexpected callback forked flag=%q", got)
+	}
+
+	complete := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/claims/github/complete", map[string]any{
+		"human_username": "mock-human",
+	}, map[string]string{
+		"Cookie": joinCookieHeader("", callback.Result().Cookies()),
+	})
+	if complete.Code != http.StatusOK {
+		t.Fatalf("claim github complete status=%d body=%s", complete.Code, complete.Body.String())
+	}
+	completeBody := parseJSONBody(t, complete)
+	if completeBody["user_id"] != userID || completeBody["status"] != "active" {
+		t.Fatalf("unexpected complete payload=%s", complete.Body.String())
+	}
+	owner, ok := completeBody["owner"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected owner payload in complete response: %s", complete.Body.String())
+	}
+	if owner["human_username"] != "mock-human" || owner["email"] != "mock-octo@example.com" {
+		t.Fatalf("unexpected owner payload=%s", complete.Body.String())
+	}
+	balance := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
+	if balance.Code != http.StatusOK {
+		t.Fatalf("expected rewarded balance read, got code=%d body=%s", balance.Code, balance.Body.String())
+	}
+	expectedBalance := srv.tokenPolicy().InitialToken + 50000 + 500000 + 200000
+	if got := balanceFromResponse(t, balance); got != expectedBalance {
+		t.Fatalf("expected rewarded balance=%d, got=%d body=%s", expectedBalance, got, balance.Body.String())
+	}
+}
+
+func TestGitHubOAuthMockRequiresUnsafeAllowFlag(t *testing.T) {
+	t.Setenv("GITHUB_API_MOCK_ENABLED", "true")
+	t.Setenv("GITHUB_API_MOCK_LOGIN", "mock-octo")
+
+	srv := newTestServer()
+	if _, ok := srv.githubOAuthMockProfile(""); ok {
+		t.Fatalf("expected github oauth mock to stay disabled without GITHUB_API_MOCK_ALLOW_UNSAFE_LOCAL")
+	}
+}
+
+func TestGitHubOAuthMockRequiresEnabledFlag(t *testing.T) {
+	t.Setenv("GITHUB_API_MOCK_ALLOW_UNSAFE_LOCAL", "true")
+	t.Setenv("GITHUB_API_MOCK_LOGIN", "mock-octo")
+
+	srv := newTestServer()
+	if _, ok := srv.githubOAuthMockProfile(""); ok {
+		t.Fatalf("expected github oauth mock to stay disabled without GITHUB_API_MOCK_ENABLED")
+	}
+}
+
+func TestClaimGitHubFrontendFlowUsesDynamicLocalGitHubMockIdentity(t *testing.T) {
+	t.Setenv("GITHUB_API_MOCK_ENABLED", "true")
+	t.Setenv("GITHUB_API_MOCK_ALLOW_UNSAFE_LOCAL", "true")
+	t.Setenv("GITHUB_API_MOCK_STARRED", "true")
+	t.Setenv("GITHUB_API_MOCK_FORKED", "true")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_ID", "gh-client")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_SECRET", "gh-secret")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_AUTHORIZE_URL", "https://github.mock.test/login/oauth/authorize")
+
+	srv := newTestServer()
+	h := identityTestHandler(srv)
+	if _, err := srv.store.Recharge(t.Context(), clawTreasurySystemID, 2_000_000); err != nil {
+		t.Fatalf("top up treasury for dynamic github mock test: %v", err)
+	}
+
+	claimWithCode := func(agentUsername, code, expectedLogin string) {
+		t.Helper()
+		_, apiKey, claimLink := registerAgentForTest(t, h, agentUsername, "oss")
+		claimToken := claimTokenFromLink(t, claimLink)
+		start := doJSONRequest(t, h, http.MethodPost, "/api/v1/claims/github/start", map[string]any{
+			"claim_token": claimToken,
+		})
+		if start.Code != http.StatusAccepted {
+			t.Fatalf("claim github start status=%d body=%s", start.Code, start.Body.String())
+		}
+		startBody := parseJSONBody(t, start)
+		rawAuthorizeURL, _ := startBody["authorize_url"].(string)
+		authorizeURL, err := neturl.Parse(rawAuthorizeURL)
+		if err != nil {
+			t.Fatalf("parse authorize_url: %v", err)
+		}
+		state := authorizeURL.Query().Get("state")
+		callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/claim/callback?code="+neturl.QueryEscape(code)+"&state="+neturl.QueryEscape(state), nil)
+		callbackReq.Header.Set("Cookie", joinCookieHeader("", start.Result().Cookies()))
+		callback := httptest.NewRecorder()
+		h.ServeHTTP(callback, callbackReq)
+		if callback.Code != http.StatusSeeOther {
+			t.Fatalf("claim github callback status=%d body=%s", callback.Code, callback.Body.String())
+		}
+		complete := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/claims/github/complete", map[string]any{
+			"human_username": expectedLogin + "-human",
+		}, map[string]string{
+			"Cookie": joinCookieHeader("", callback.Result().Cookies()),
+		})
+		if complete.Code != http.StatusOK {
+			t.Fatalf("claim github complete status=%d body=%s", complete.Code, complete.Body.String())
+		}
+		completeBody := parseJSONBody(t, complete)
+		owner, ok := completeBody["owner"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected owner payload in complete response: %s", complete.Body.String())
+		}
+		if owner["email"] != expectedLogin+"@example.com" {
+			t.Fatalf("unexpected owner email=%v payload=%s", owner["email"], complete.Body.String())
+		}
+		if githubInfo, ok := completeBody["github"].(map[string]any); !ok || githubInfo["username"] != expectedLogin {
+			t.Fatalf("unexpected github payload=%s", complete.Body.String())
+		}
+		balance := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
+		if balance.Code != http.StatusOK {
+			t.Fatalf("expected rewarded balance read, got code=%d body=%s", balance.Code, balance.Body.String())
+		}
+		expectedBalance := srv.tokenPolicy().InitialToken + 50000 + 500000 + 200000
+		if got := balanceFromResponse(t, balance); got != expectedBalance {
+			t.Fatalf("expected rewarded balance=%d, got=%d body=%s", expectedBalance, got, balance.Body.String())
+		}
+	}
+
+	claimWithCode("github-mock-agent-alice", "gh-code-alice", "alice")
+	claimWithCode("github-mock-agent-bob", "gh-code-bob", "bob")
+}
+
 func TestClaimGitHubCallbackRejectsMissingVerifiedEmail(t *testing.T) {
 	gh := enableGitHubOAuthForTestWithEmails(t, false, false, []githubEmailRecord{
 		{Email: "octo@example.com", Primary: true, Verified: false},

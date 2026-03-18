@@ -1680,6 +1680,11 @@ func (s *Server) writeSocialCallbackSuccess(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) exchangeSocialOAuthCode(ctx context.Context, cfg socialOAuthProviderConfig, code, redirectURI, codeVerifier string) (string, error) {
+	if cfg.Provider == "github" {
+		if _, ok := s.githubOAuthMockProfile(""); ok {
+			return s.githubOAuthMockAccessTokenForCode(code), nil
+		}
+	}
 	form := neturl.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", strings.TrimSpace(code))
@@ -1723,6 +1728,13 @@ func (s *Server) exchangeSocialOAuthCode(ctx context.Context, cfg socialOAuthPro
 }
 
 func (s *Server) fetchGitHubViewer(ctx context.Context, accessToken string) (githubViewer, error) {
+	if profile, ok := s.githubOAuthMockProfile(accessToken); ok {
+		return githubViewer{
+			ID:    profile.UserID,
+			Login: profile.Login,
+			Name:  profile.Name,
+		}, nil
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.githubOAuthUserInfoURL(), nil)
 	if err != nil {
 		return githubViewer{}, err
@@ -1982,6 +1994,10 @@ func (s *Server) githubAPIBaseURL() string {
 }
 
 func (s *Server) verifyGitHubStar(ctx context.Context, username string) (bool, error) {
+	if _, ok := s.githubOAuthMockProfile(""); ok {
+		starred, _ := s.githubOAuthMockFlags(username)
+		return starred, nil
+	}
 	target := strings.ToLower(strings.TrimSpace(s.officialGitHubRepo()))
 	for page := 1; page <= maxGitHubVerificationPages; page++ {
 		var repos []githubRepoRecord
@@ -2004,6 +2020,10 @@ func (s *Server) verifyGitHubStar(ctx context.Context, username string) (bool, e
 }
 
 func (s *Server) verifyGitHubFork(ctx context.Context, username string) (bool, error) {
+	if _, ok := s.githubOAuthMockProfile(""); ok {
+		_, forked := s.githubOAuthMockFlags(username)
+		return forked, nil
+	}
 	target := strings.ToLower(strings.TrimSpace(s.officialGitHubRepo()))
 	for page := 1; page <= maxGitHubVerificationPages; page++ {
 		var repos []githubRepoRecord

@@ -1,9 +1,15 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
+
+	"clawcolony/internal/store"
 )
 
 func TestToolInvokeSplitsManifestPriceUnderTokenEconomyV2(t *testing.T) {
@@ -70,4 +76,92 @@ func TestToolInvokeSplitsManifestPriceUnderTokenEconomyV2(t *testing.T) {
 	if got := treasuryBalanceForTest(t, srv); got != beforeTreasury+30 {
 		t.Fatalf("treasury balance=%d want %d", got, beforeTreasury+30)
 	}
+}
+
+func TestToolReviewApproveWithFunctionalClusterKeyDoesNotDeadlock(t *testing.T) {
+	srv := newTestServer()
+	authorUserID, authorAPIKey := seedActiveUserWithAPIKey(t, srv)
+	reviewerUserID, reviewerAPIKey := seedActiveUserWithAPIKey(t, srv)
+
+	register := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/tools/register", map[string]any{
+		"tool_id":       "cluster-safe-tool",
+		"name":          "Cluster Safe Tool",
+		"description":   "verifies approve path exits cleanly",
+		"tier":          "T2",
+		"category_hint": "analysis",
+		"manifest":      `{"metadata":{"colony":{"price":250}}}`,
+		"code":          "echo ok",
+	}, apiKeyHeaders(authorAPIKey))
+	if register.Code != http.StatusAccepted {
+		t.Fatalf("tool register status=%d body=%s", register.Code, register.Body.String())
+	}
+
+	reviewPayload, err := json.Marshal(map[string]any{
+		"tool_id":                "cluster-safe-tool",
+		"decision":               "approve",
+		"review_note":            "cluster approved",
+		"functional_cluster_key": "analysis-cluster",
+	})
+	if err != nil {
+		t.Fatalf("marshal review payload: %v", err)
+	}
+	done := make(chan *httptestResponse, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/tools/review", bytes.NewReader(reviewPayload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+reviewerAPIKey)
+		w := httptest.NewRecorder()
+		srv.mux.ServeHTTP(w, req)
+		done <- &httptestResponse{code: w.Code, body: w.Body.String()}
+	}()
+
+	select {
+	case result := <-done:
+		if result.code != http.StatusAccepted {
+			t.Fatalf("tool review status=%d body=%s", result.code, result.body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("tool review approve deadlocked when functional_cluster_key was present")
+	}
+
+	ctx := context.Background()
+	events, err := srv.store.ListEconomyContributionEvents(ctx, store.EconomyContributionEventFilter{
+		ResourceType: "tool",
+		ResourceID:   "cluster-safe-tool",
+		Limit:        10,
+	})
+	if err != nil {
+		t.Fatalf("list contribution events: %v", err)
+	}
+	gotKinds := map[string]bool{}
+	for _, event := range events {
+		gotKinds[event.Kind] = true
+	}
+	for _, kind := range []string{"tool.approve", "community.review.tool"} {
+		if !gotKinds[kind] {
+			t.Fatalf("missing contribution event kind %q in %#v", kind, events)
+		}
+	}
+
+	approveDecision, err := srv.store.GetEconomyRewardDecision(ctx, "tool.approve:cluster-safe-tool")
+	if err != nil {
+		t.Fatalf("get tool approve decision: %v", err)
+	}
+	if approveDecision.Status != "applied" || approveDecision.RecipientUserID != authorUserID || approveDecision.Amount <= 0 {
+		t.Fatalf("unexpected tool approve decision: %+v", approveDecision)
+	}
+
+	reviewDecisionKey := "community.review.tool:cluster-safe-tool:" + reviewerUserID
+	reviewDecision, err := srv.store.GetEconomyRewardDecision(ctx, reviewDecisionKey)
+	if err != nil {
+		t.Fatalf("get community review decision: %v", err)
+	}
+	if reviewDecision.Status != "applied" || reviewDecision.RecipientUserID != reviewerUserID || reviewDecision.Amount <= 0 {
+		t.Fatalf("unexpected tool review decision: %+v", reviewDecision)
+	}
+}
+
+type httptestResponse struct {
+	code int
+	body string
 }

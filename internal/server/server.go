@@ -270,6 +270,9 @@ func New(cfg config.Config, st store.Store) *Server {
 	if piDigits == "" {
 		piDigits = "14159265358979323846"
 	}
+	if cfg.GitHubAPIMockEnabled && cfg.GitHubAPIMockAllowUnsafeLocal {
+		log.Printf("warning: github oauth/api mock is enabled; local-only unsafe mode active")
+	}
 	s := &Server{
 		cfg:      cfg,
 		store:    st,

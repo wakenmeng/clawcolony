@@ -336,19 +336,60 @@ func (s *PostgresStore) UpsertEconomyKnowledgeMeta(ctx context.Context, item Eco
 	if item.ProposalID <= 0 && item.EntryID <= 0 {
 		return EconomyKnowledgeMeta{}, fmt.Errorf("proposal_id or entry_id is required")
 	}
-	err := s.db.QueryRowContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return EconomyKnowledgeMeta{}, err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	if err := lockEconomyKnowledgeMetaTx(ctx, tx, item.ProposalID, item.EntryID); err != nil {
+		return EconomyKnowledgeMeta{}, err
+	}
+	var existing EconomyKnowledgeMeta
+	err = tx.QueryRowContext(ctx, `
+		SELECT proposal_id, entry_id, category, references_json, author_user_id, content_tokens, updated_at
+		FROM economy_knowledge_meta
+		WHERE ($1 > 0 AND proposal_id = $1)
+		   OR ($2 > 0 AND entry_id = $2)
+		ORDER BY CASE WHEN $1 > 0 AND proposal_id = $1 THEN 0 ELSE 1 END
+		LIMIT 1
+		FOR UPDATE
+	`, item.ProposalID, item.EntryID).
+		Scan(&existing.ProposalID, &existing.EntryID, &existing.Category, &existing.ReferencesJSON, &existing.AuthorUserID, &existing.ContentTokens, &existing.UpdatedAt)
+	switch err {
+	case nil:
+		item = mergeEconomyKnowledgeMeta(item, existing)
+		err = tx.QueryRowContext(ctx, `
+			UPDATE economy_knowledge_meta
+			SET proposal_id = $1,
+			    entry_id = $2,
+			    category = $3,
+			    references_json = $4,
+			    author_user_id = $5,
+			    content_tokens = $6,
+			    updated_at = NOW()
+			WHERE proposal_id = $7 AND entry_id = $8
+			RETURNING proposal_id, entry_id, category, references_json, author_user_id, content_tokens, updated_at
+		`, item.ProposalID, item.EntryID, item.Category, emptyJSON(item.ReferencesJSON, "[]"), item.AuthorUserID, item.ContentTokens, existing.ProposalID, existing.EntryID).
+			Scan(&item.ProposalID, &item.EntryID, &item.Category, &item.ReferencesJSON, &item.AuthorUserID, &item.ContentTokens, &item.UpdatedAt)
+		if err != nil {
+			return EconomyKnowledgeMeta{}, err
+		}
+	case sql.ErrNoRows:
+		err = tx.QueryRowContext(ctx, `
 		INSERT INTO economy_knowledge_meta(proposal_id, entry_id, category, references_json, author_user_id, content_tokens, updated_at)
 		VALUES($1, $2, $3, $4, $5, $6, NOW())
-		ON CONFLICT (proposal_id, entry_id) DO UPDATE SET
-			category = EXCLUDED.category,
-			references_json = EXCLUDED.references_json,
-			author_user_id = EXCLUDED.author_user_id,
-			content_tokens = EXCLUDED.content_tokens,
-			updated_at = NOW()
 		RETURNING proposal_id, entry_id, category, references_json, author_user_id, content_tokens, updated_at
 	`, item.ProposalID, item.EntryID, item.Category, emptyJSON(item.ReferencesJSON, "[]"), item.AuthorUserID, item.ContentTokens).
-		Scan(&item.ProposalID, &item.EntryID, &item.Category, &item.ReferencesJSON, &item.AuthorUserID, &item.ContentTokens, &item.UpdatedAt)
-	if err != nil {
+			Scan(&item.ProposalID, &item.EntryID, &item.Category, &item.ReferencesJSON, &item.AuthorUserID, &item.ContentTokens, &item.UpdatedAt)
+		if err != nil {
+			return EconomyKnowledgeMeta{}, err
+		}
+	default:
+		return EconomyKnowledgeMeta{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return EconomyKnowledgeMeta{}, err
 	}
 	return item, nil
@@ -491,4 +532,45 @@ func emptyJSON(v, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+func mergeEconomyKnowledgeMeta(item, existing EconomyKnowledgeMeta) EconomyKnowledgeMeta {
+	if item.ProposalID <= 0 {
+		item.ProposalID = existing.ProposalID
+	}
+	if item.EntryID <= 0 {
+		item.EntryID = existing.EntryID
+	}
+	if strings.TrimSpace(item.Category) == "" {
+		item.Category = existing.Category
+	}
+	if strings.TrimSpace(item.ReferencesJSON) == "" {
+		item.ReferencesJSON = existing.ReferencesJSON
+	}
+	if strings.TrimSpace(item.AuthorUserID) == "" {
+		item.AuthorUserID = existing.AuthorUserID
+	}
+	if item.ContentTokens <= 0 {
+		item.ContentTokens = existing.ContentTokens
+	}
+	return item
+}
+
+func lockEconomyKnowledgeMetaTx(ctx context.Context, tx *sql.Tx, proposalID, entryID int64) error {
+	keys := make([]int64, 0, 2)
+	if proposalID > 0 {
+		keys = append(keys, proposalID)
+	}
+	if entryID > 0 {
+		keys = append(keys, -entryID)
+	}
+	if len(keys) == 2 && keys[1] < keys[0] {
+		keys[0], keys[1] = keys[1], keys[0]
+	}
+	for _, key := range keys {
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`, "economy_knowledge_meta", fmt.Sprintf("%d", key)); err != nil {
+			return err
+		}
+	}
+	return nil
 }

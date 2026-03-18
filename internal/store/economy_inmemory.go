@@ -247,6 +247,23 @@ func (s *InMemoryStore) UpsertEconomyKnowledgeMeta(_ context.Context, item Econo
 	if item.ProposalID <= 0 && item.EntryID <= 0 {
 		return EconomyKnowledgeMeta{}, fmt.Errorf("proposal_id or entry_id is required")
 	}
+	if existing, ok := s.knowledgeMetaByProp[item.ProposalID]; ok {
+		if existing.ProposalID > 0 {
+			delete(s.knowledgeMetaByProp, existing.ProposalID)
+		}
+		if existing.EntryID > 0 {
+			delete(s.knowledgeMetaByEntry, existing.EntryID)
+		}
+		item = mergeEconomyKnowledgeMeta(item, existing)
+	} else if existing, ok := s.knowledgeMetaByEntry[item.EntryID]; ok {
+		if existing.ProposalID > 0 {
+			delete(s.knowledgeMetaByProp, existing.ProposalID)
+		}
+		if existing.EntryID > 0 {
+			delete(s.knowledgeMetaByEntry, existing.EntryID)
+		}
+		item = mergeEconomyKnowledgeMeta(item, existing)
+	}
 	item.UpdatedAt = time.Now().UTC()
 	if item.ProposalID > 0 {
 		s.knowledgeMetaByProp[item.ProposalID] = item

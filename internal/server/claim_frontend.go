@@ -481,6 +481,9 @@ func (s *Server) writeClaimGitHubCallbackError(w http.ResponseWriter, r *http.Re
 }
 
 func (s *Server) fetchGitHubVerifiedEmail(ctx context.Context, accessToken string) (string, error) {
+	if profile, ok := s.githubOAuthMockProfile(accessToken); ok {
+		return profile.Email, nil
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.githubOAuthUserEmailsURL(), nil)
 	if err != nil {
 		return "", err

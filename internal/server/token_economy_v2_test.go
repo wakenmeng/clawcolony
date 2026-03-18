@@ -233,3 +233,59 @@ func TestTokenEconomyV2MigrationMovesLegacySettingsIntoStore(t *testing.T) {
 		t.Fatalf("unexpected tool meta: %+v", toolMeta)
 	}
 }
+
+func TestMoveProposalKnowledgeMetaToEntryPreservesMeta(t *testing.T) {
+	srv := newTestServer()
+	assertMoveProposalKnowledgeMetaToEntry(t, srv)
+}
+
+func TestMoveProposalKnowledgeMetaToEntryPostgresIntegration(t *testing.T) {
+	srv := newPostgresIntegrationServer(t)
+	assertMoveProposalKnowledgeMetaToEntry(t, srv)
+}
+
+func assertMoveProposalKnowledgeMetaToEntry(t *testing.T, srv *Server) {
+	t.Helper()
+	ctx := context.Background()
+	baseID := time.Now().UTC().UnixNano()
+	proposalID := baseID
+	entryID := baseID + 1
+
+	_, err := srv.store.UpsertEconomyKnowledgeMeta(ctx, store.EconomyKnowledgeMeta{
+		ProposalID:     proposalID,
+		Category:       "analysis",
+		ReferencesJSON: `[{"ref_type":"ganglion","ref_id":"42"}]`,
+		AuthorUserID:   "author-before",
+		ContentTokens:  1234,
+	})
+	if err != nil {
+		t.Fatalf("seed proposal knowledge meta: %v", err)
+	}
+
+	moved, err := srv.moveProposalKnowledgeMetaToEntry(ctx, proposalID, entryID, "author-after")
+	if err != nil {
+		t.Fatalf("move proposal knowledge meta: %v", err)
+	}
+	if moved.ProposalID != proposalID || moved.EntryID != entryID {
+		t.Fatalf("unexpected moved ids: %+v", moved)
+	}
+	if moved.Category != "analysis" || moved.AuthorUserID != "author-after" || moved.ContentTokens != 1234 {
+		t.Fatalf("unexpected moved content: %+v", moved)
+	}
+
+	proposalMeta, err := srv.store.GetEconomyKnowledgeMetaByProposal(ctx, proposalID)
+	if err != nil {
+		t.Fatalf("get proposal knowledge meta after move: %v", err)
+	}
+	if proposalMeta.EntryID != entryID || proposalMeta.AuthorUserID != "author-after" {
+		t.Fatalf("unexpected proposal knowledge meta after move: %+v", proposalMeta)
+	}
+
+	entryMeta, err := srv.store.GetEconomyKnowledgeMetaByEntry(ctx, entryID)
+	if err != nil {
+		t.Fatalf("get entry knowledge meta after move: %v", err)
+	}
+	if entryMeta.ProposalID != proposalID || entryMeta.EntryID != entryID || entryMeta.ContentTokens != 1234 {
+		t.Fatalf("unexpected entry knowledge meta after move: %+v", entryMeta)
+	}
+}
