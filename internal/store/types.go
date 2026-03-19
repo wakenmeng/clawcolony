@@ -95,6 +95,45 @@ type MailContact struct {
 	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
+type NotificationDeliveryState struct {
+	OwnerAddress   string    `json:"owner_address"`
+	Category       string    `json:"category"`
+	StateHash      string    `json:"state_hash"`
+	LastSentAt     time.Time `json:"last_sent_at"`
+	LastRemindedAt time.Time `json:"last_reminded_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+type MailArchiveBatchInput struct {
+	Categories []string `json:"categories"`
+	Limit      int      `json:"limit"`
+	BatchID    string   `json:"batch_id"`
+}
+
+type MailArchiveCategoryStat struct {
+	Category        string `json:"category"`
+	InboxKeepCount  int64  `json:"inbox_keep_count"`
+	InboxArchiveCnt int64  `json:"inbox_archive_count"`
+	OutboxArchiveCt int64  `json:"outbox_archive_count"`
+}
+
+type MailArchivePreview struct {
+	Categories          []MailArchiveCategoryStat `json:"categories"`
+	ArchiveMailboxCount int64                     `json:"archive_mailbox_count"`
+	ArchiveMessageCount int64                     `json:"archive_message_count"`
+}
+
+type MailArchiveBatchResult struct {
+	BatchID             string                    `json:"batch_id"`
+	ArchivedMailboxIDs  []int64                   `json:"archived_mailbox_ids,omitempty"`
+	ArchivedMessageIDs  []int64                   `json:"archived_message_ids,omitempty"`
+	ArchiveMailboxCount int64                     `json:"archive_mailbox_count"`
+	ArchiveMessageCount int64                     `json:"archive_message_count"`
+	LastInboxMailboxID  int64                     `json:"last_inbox_mailbox_id"`
+	HasMore             bool                      `json:"has_more"`
+	Categories          []MailArchiveCategoryStat `json:"categories,omitempty"`
+}
+
 type TokenAccount struct {
 	BotID     string    `json:"user_id"`
 	Balance   int64     `json:"balance"`
@@ -612,6 +651,11 @@ type Store interface {
 	GetMailboxItem(ctx context.Context, mailboxID int64) (MailItem, error)
 	ListMailbox(ctx context.Context, ownerAddress, folder, scope, keyword string, fromTime, toTime *time.Time, limit int) ([]MailItem, error)
 	MarkMailboxRead(ctx context.Context, ownerAddress string, mailboxIDs []int64) error
+	GetNotificationDeliveryState(ctx context.Context, ownerAddress, category string) (NotificationDeliveryState, bool, error)
+	UpsertNotificationDeliveryState(ctx context.Context, state NotificationDeliveryState) (NotificationDeliveryState, error)
+	DeleteNotificationDeliveryState(ctx context.Context, ownerAddress, category string) error
+	PreviewSystemMailArchive(ctx context.Context, categories []string) (MailArchivePreview, error)
+	ArchiveSystemMailBatch(ctx context.Context, input MailArchiveBatchInput) (MailArchiveBatchResult, error)
 	UpsertMailContact(ctx context.Context, c MailContact) (MailContact, error)
 	ListMailContacts(ctx context.Context, ownerAddress, keyword string, limit int) ([]MailContact, error)
 	ListMailContactsUpdated(ctx context.Context, ownerAddress, keyword string, fromTime, toTime *time.Time, limit int) ([]MailContact, error)
