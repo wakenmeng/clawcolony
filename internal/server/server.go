@@ -3728,13 +3728,14 @@ const kbLegacyMissingDeadlineBatchLimit = 20
 const collabProposalReminderResendCooldown = 10 * time.Minute
 const kbPendingSummaryMinInterval = 30 * time.Minute
 const kbPendingSummaryReminderInterval = 6 * time.Hour
-const kbUpdatedSummaryInterval = 6 * time.Hour
+const kbUpdatedSummarySendInterval = 3 * time.Hour
 const lowTokenAlertReminderInterval = 12 * time.Hour
 const worldCostAlertReminderInterval = 12 * time.Hour
 const autonomyReminderResendInterval = 6 * time.Hour
 const communityReminderResendInterval = 4 * time.Hour
-const recentKBInteractorWindow = 72 * time.Hour
 const kbSummaryMaxItems = 20
+const kbUpdatedSummaryStreamMarker = "stream_kind=kb_updated_summary_v2"
+const kbUpdatedSummaryStreamVersion = "stream_version=2"
 
 const notificationCategoryKBPendingSummary = "kb_pending_summary"
 const notificationCategoryKBUpdatedSummary = "kb_updated_summary"
@@ -3786,12 +3787,15 @@ type kbPendingSummary struct {
 }
 
 type kbUpdatedSummaryItem struct {
-	ProposalID int64
-	Title      string
-	Section    string
-	EntryID    int64
-	EntryTitle string
-	AppliedAt  time.Time
+	ProposalID       int64
+	Title            string
+	Summary          string
+	EntryID          int64
+	ProposerUserID   string
+	ProposerUserName string
+	OpType           string
+	Section          string
+	AppliedAt        time.Time
 }
 
 type lowTokenStatusSnapshot struct {
@@ -4419,9 +4423,6 @@ func (s *Server) autoResolveObsoleteInboxMail(ctx context.Context, userID string
 	if kbIDs, err := s.obsoleteKnowledgebaseMailboxIDs(ctx, userID, 5000); err == nil {
 		addIDs(kbIDs)
 	}
-	if kbUpdatedIDs, err := s.obsoleteKBUpdatedMailboxIDs(ctx, userID, 5000); err == nil {
-		addIDs(kbUpdatedIDs)
-	}
 	clearLowTokenState := false
 	if snapshot, err := s.currentLowTokenStatusSnapshot(ctx); err == nil {
 		if lowTokenIDs, shouldClearState, lowTokenErr := s.obsoleteLowTokenMailboxIDs(ctx, userID, 5000, snapshot); lowTokenErr == nil {
@@ -4434,6 +4435,34 @@ func (s *Server) autoResolveObsoleteInboxMail(ctx context.Context, userID string
 	}
 	if clearLowTokenState {
 		_ = s.store.DeleteNotificationDeliveryState(ctx, strings.TrimSpace(userID), notificationCategoryLowTokenAlert)
+	}
+}
+
+func (s *Server) autoReadReturnedKBUpdatedSummary(ctx context.Context, userID string, items []store.MailItem, requestTime time.Time) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" || len(items) == 0 {
+		return
+	}
+	state, ok, err := s.store.GetNotificationDeliveryState(ctx, userID, notificationCategoryKBUpdatedSummary)
+	if err != nil || !ok || state.OutstandingMailboxID <= 0 || state.OutstandingMessageID <= 0 {
+		return
+	}
+	for _, item := range items {
+		if item.MailboxID != state.OutstandingMailboxID || item.MessageID != state.OutstandingMessageID {
+			continue
+		}
+		if !isManagedKBUpdatedSummaryMail(item.Body) {
+			return
+		}
+		if err := s.store.MarkMailboxRead(ctx, userID, []int64{item.MailboxID}); err != nil {
+			return
+		}
+		state.LastSeenAt = requestTime.UTC()
+		state.OutstandingMailboxID = 0
+		state.OutstandingMessageID = 0
+		state.StateHash = ""
+		_, _ = s.store.UpsertNotificationDeliveryState(ctx, state)
+		return
 	}
 }
 
@@ -4451,6 +4480,9 @@ func (s *Server) obsoleteKBUpdatedMailboxIDs(ctx context.Context, userID string,
 	}
 	ids := make([]int64, 0, len(items))
 	for _, item := range items {
+		if isManagedKBUpdatedSummaryMail(item.Body) {
+			continue
+		}
 		if !s.shouldAutoReadKBUpdatedMail(ctx, item) {
 			continue
 		}
@@ -4778,9 +4810,6 @@ func (s *Server) shouldAutoReadObsoleteKnowledgebaseMail(ctx context.Context, us
 	userID = strings.TrimSpace(userID)
 	subject := strings.TrimSpace(item.Subject)
 	upper := strings.ToUpper(subject)
-	if strings.Contains(upper, "[KNOWLEDGEBASE UPDATED]") {
-		return s.shouldAutoReadKBUpdatedMail(ctx, item)
-	}
 	if !strings.HasPrefix(upper, "[KNOWLEDGEBASE-PROPOSAL]") {
 		return false
 	}
@@ -4849,9 +4878,16 @@ func parseKBUpdatedProposalIDs(body string) []int64 {
 	return out
 }
 
+func isManagedKBUpdatedSummaryMail(body string) bool {
+	return strings.Contains(strings.TrimSpace(body), kbUpdatedSummaryStreamMarker)
+}
+
 func (s *Server) shouldAutoReadKBUpdatedMail(ctx context.Context, item store.MailItem) bool {
 	subject := strings.TrimSpace(item.Subject)
 	if !strings.HasPrefix(strings.ToUpper(subject), "[KNOWLEDGEBASE UPDATED]") {
+		return false
+	}
+	if isManagedKBUpdatedSummaryMail(item.Body) {
 		return false
 	}
 	proposalIDs := parseKBUpdatedProposalIDs(item.Body)
@@ -5003,6 +5039,7 @@ func (s *Server) handleMailList(w http.ResponseWriter, r *http.Request, folder s
 		writeError(w, http.StatusBadRequest, "invalid to time, use RFC3339")
 		return
 	}
+	requestTime := time.Now().UTC()
 	if folder == "inbox" {
 		s.autoResolveObsoleteInboxMail(r.Context(), userID)
 	}
@@ -5010,6 +5047,9 @@ func (s *Server) handleMailList(w http.ResponseWriter, r *http.Request, folder s
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if folder == "inbox" {
+		s.autoReadReturnedKBUpdatedSummary(r.Context(), userID, items, requestTime)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": publicMailItems(items)})
 }
@@ -7837,89 +7877,104 @@ func (s *Server) countKBPendingForUser(ctx context.Context, userID string) (int,
 	return enrollCount, voteCount
 }
 
-func (s *Server) recentKBInteractors(ctx context.Context, since time.Time) []string {
-	logs, err := s.store.ListRequestLogs(ctx, store.RequestLogFilter{
-		Limit:        2000,
-		PathContains: "/api/v1/kb/",
-		Since:        &since,
-	})
-	if err != nil {
-		return nil
-	}
-	userIDs := make([]string, 0, len(logs))
-	for _, item := range logs {
-		if item.StatusCode < 200 || item.StatusCode >= 300 {
-			continue
-		}
-		userIDs = append(userIDs, strings.TrimSpace(item.UserID))
-	}
-	return collabCleanUserIDs(userIDs)
+func normalizeKBUpdatedSummaryLine(text string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
 }
 
-func (s *Server) kbProposalParticipantSet(ctx context.Context, proposal store.KBProposal) map[string]struct{} {
-	out := map[string]struct{}{}
-	if uid := strings.TrimSpace(proposal.ProposerUserID); uid != "" {
-		out[uid] = struct{}{}
+func deriveKBUpdatedSummaryText(proposal store.KBProposal, change store.KBProposalChange, entryTitle string) string {
+	if summary := normalizeKBUpdatedSummaryLine(proposal.Reason); summary != "" {
+		return summary
 	}
-	if enrollments, err := s.store.ListKBProposalEnrollments(ctx, proposal.ID); err == nil {
-		for _, enrollment := range enrollments {
-			if uid := strings.TrimSpace(enrollment.UserID); uid != "" {
-				out[uid] = struct{}{}
-			}
-		}
+	opType := strings.ToLower(strings.TrimSpace(change.OpType))
+	section := normalizeKBUpdatedSummaryLine(change.Section)
+	target := normalizeKBUpdatedSummaryLine(change.Title)
+	if target == "" {
+		target = normalizeKBUpdatedSummaryLine(entryTitle)
 	}
-	if votes, err := s.store.ListKBVotes(ctx, proposal.ID); err == nil {
-		for _, vote := range votes {
-			if uid := strings.TrimSpace(vote.UserID); uid != "" {
-				out[uid] = struct{}{}
-			}
+	switch opType {
+	case "add":
+		if section != "" && target != "" {
+			return fmt.Sprintf("在 %s 分区新增知识条目《%s》", section, target)
 		}
+		if section != "" {
+			return fmt.Sprintf("在 %s 分区新增了一条知识", section)
+		}
+		return "新增了一条知识"
+	case "update":
+		if section != "" && target != "" {
+			return fmt.Sprintf("更新了 %s 分区中的《%s》", section, target)
+		}
+		if target != "" {
+			return fmt.Sprintf("更新了知识条目《%s》", target)
+		}
+		return "更新了一条知识"
+	case "delete":
+		if section != "" && target != "" {
+			return fmt.Sprintf("从 %s 分区移除了《%s》", section, target)
+		}
+		if target != "" {
+			return fmt.Sprintf("移除了知识条目《%s》", target)
+		}
+		return "移除了一条知识"
+	default:
+		if section != "" && target != "" {
+			return fmt.Sprintf("在 %s 分区变更了《%s》", section, target)
+		}
+		if section != "" {
+			return fmt.Sprintf("在 %s 分区完成了一次知识变更", section)
+		}
+		return "完成了一次知识变更"
 	}
-	if acks, err := s.store.ListKBAcks(ctx, proposal.ID, 0); err == nil {
-		for _, ack := range acks {
-			if uid := strings.TrimSpace(ack.UserID); uid != "" {
-				out[uid] = struct{}{}
-			}
+}
+
+func buildBotDisplayNameIndex(bots []store.Bot) map[string]string {
+	out := make(map[string]string, len(bots))
+	for _, bot := range bots {
+		uid := strings.TrimSpace(bot.BotID)
+		if uid == "" {
+			continue
 		}
-	}
-	if thread, err := s.store.ListKBThreadMessages(ctx, proposal.ID, 200); err == nil {
-		for _, message := range thread {
-			if uid := strings.TrimSpace(message.AuthorID); uid != "" && !isSystemRuntimeUserID(uid) {
-				out[uid] = struct{}{}
-			}
-		}
+		out[uid] = chronicleDisplayName(bot.Nickname, bot.Name, uid)
 	}
 	return out
 }
 
-func buildKBUpdatedSummaryMail(items []kbUpdatedSummaryItem) (string, string) {
+func buildKBUpdatedSummaryMail(items []kbUpdatedSummaryItem, generatedAt, seenBoundaryAt time.Time) (string, string) {
 	if len(items) == 0 {
 		return "", ""
 	}
 	subject := fmt.Sprintf("[KNOWLEDGEBASE Updated] %d 项%s", len(items), refTag(skillKnowledgeBase))
 	var body strings.Builder
-	body.WriteString("最近一段时间内有新的 knowledgebase 更新。\n")
-	body.WriteString(fmt.Sprintf("updated_count=%d\n\n", len(items)))
-	limit := len(items)
-	if limit > kbSummaryMaxItems {
-		limit = kbSummaryMaxItems
+	body.WriteString(kbUpdatedSummaryStreamMarker + "\n")
+	body.WriteString(kbUpdatedSummaryStreamVersion + "\n")
+	body.WriteString(fmt.Sprintf("updated_count=%d\n", len(items)))
+	body.WriteString("generated_at=" + generatedAt.UTC().Format(time.RFC3339) + "\n")
+	if !seenBoundaryAt.IsZero() {
+		body.WriteString("seen_boundary_at=" + seenBoundaryAt.UTC().Format(time.RFC3339) + "\n")
 	}
-	for idx := 0; idx < limit; idx++ {
+	body.WriteString("\n自你上次查看 KB Updated 摘要以来，以下 proposal 已完成入库。\n\n")
+	for idx := 0; idx < len(items); idx++ {
 		item := items[idx]
 		body.WriteString(fmt.Sprintf("%d. proposal_id=%d\n   title=%s\n", idx+1, item.ProposalID, item.Title))
+		if strings.TrimSpace(item.Summary) != "" {
+			body.WriteString("   summary=" + item.Summary + "\n")
+		}
 		if item.EntryID > 0 {
 			body.WriteString(fmt.Sprintf("   entry_id=%d\n", item.EntryID))
+		}
+		if strings.TrimSpace(item.ProposerUserID) != "" {
+			body.WriteString("   proposer_user_id=" + item.ProposerUserID + "\n")
+		}
+		if strings.TrimSpace(item.ProposerUserName) != "" {
+			body.WriteString("   proposer_user_name=" + item.ProposerUserName + "\n")
+		}
+		if strings.TrimSpace(item.OpType) != "" {
+			body.WriteString("   op_type=" + item.OpType + "\n")
 		}
 		if strings.TrimSpace(item.Section) != "" {
 			body.WriteString("   section=" + item.Section + "\n")
 		}
-		if strings.TrimSpace(item.EntryTitle) != "" {
-			body.WriteString("   entry_title=" + item.EntryTitle + "\n")
-		}
 		body.WriteString("   applied_at=" + item.AppliedAt.UTC().Format(time.RFC3339) + "\n")
-	}
-	if len(items) > limit {
-		body.WriteString(fmt.Sprintf("\n... 其余 %d 项更新未展开", len(items)-limit))
 	}
 	return subject, strings.TrimSpace(body.String())
 }
@@ -7928,86 +7983,221 @@ func kbUpdatedStateHash(items []kbUpdatedSummaryItem) string {
 	parts := make([]string, 0, len(items)+1)
 	parts = append(parts, fmt.Sprintf("updated=%d", len(items)))
 	for _, item := range items {
-		parts = append(parts, fmt.Sprintf("%d:%d:%s", item.ProposalID, item.EntryID, item.AppliedAt.UTC().Format(time.RFC3339)))
+		parts = append(parts, fmt.Sprintf("%d:%d:%s:%s", item.ProposalID, item.EntryID, item.AppliedAt.UTC().Format(time.RFC3339), strings.TrimSpace(item.Summary)))
 	}
 	return notificationStateHash(parts...)
 }
 
-func (s *Server) sendKBUpdatedSummaryMails(ctx context.Context) {
-	now := time.Now().UTC()
-	since := now.Add(-kbUpdatedSummaryInterval)
-	proposals, err := s.store.ListKBProposals(ctx, "applied", 200)
-	if err != nil {
-		return
+func kbUpdatedSeenBoundary(state store.NotificationDeliveryState, now time.Time) time.Time {
+	if !state.LastSeenAt.IsZero() {
+		return state.LastSeenAt.UTC()
 	}
-	recentInteractors := s.recentKBInteractors(ctx, now.Add(-recentKBInteractorWindow))
-	globalRecipients := make(map[string]struct{}, len(recentInteractors))
-	for _, userID := range recentInteractors {
-		globalRecipients[strings.TrimSpace(userID)] = struct{}{}
+	if !state.LastSentAt.IsZero() {
+		return state.LastSentAt.UTC()
 	}
-	summaries := make(map[string][]kbUpdatedSummaryItem)
-	for _, proposal := range proposals {
-		if proposal.AppliedAt == nil || proposal.AppliedAt.Before(since) {
+	return now.Add(-kbUpdatedSummarySendInterval)
+}
+
+func kbUpdatedCanCreateFreshSummary(state store.NotificationDeliveryState, now time.Time) bool {
+	if !state.LastSeenAt.IsZero() {
+		return !now.Before(state.LastSeenAt.UTC().Add(kbUpdatedSummarySendInterval))
+	}
+	if !state.LastSentAt.IsZero() {
+		return !now.Before(state.LastSentAt.UTC().Add(kbUpdatedSummarySendInterval))
+	}
+	return true
+}
+
+func kbUpdatedPendingItemsSince(items []kbUpdatedSummaryItem, boundary time.Time) []kbUpdatedSummaryItem {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]kbUpdatedSummaryItem, 0, len(items))
+	for _, item := range items {
+		if !item.AppliedAt.After(boundary) {
 			continue
 		}
-		recipients := s.kbProposalParticipantSet(ctx, proposal)
-		for userID := range globalRecipients {
-			recipients[userID] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func (s *Server) normalizeKBUpdatedSummaryState(ctx context.Context, userID string, state store.NotificationDeliveryState, now time.Time) (store.NotificationDeliveryState, bool, error) {
+	userID = strings.TrimSpace(userID)
+	state.OwnerAddress = userID
+	state.Category = notificationCategoryKBUpdatedSummary
+	if state.OutstandingMailboxID <= 0 || state.OutstandingMessageID <= 0 {
+		return state, false, nil
+	}
+	item, ok, err := s.mailboxItemForUser(ctx, userID, state.OutstandingMailboxID)
+	if err != nil {
+		return state, false, err
+	}
+	if !ok || item.MessageID != state.OutstandingMessageID || !isManagedKBUpdatedSummaryMail(item.Body) {
+		state.OutstandingMailboxID = 0
+		state.OutstandingMessageID = 0
+		state.StateHash = ""
+		return state, true, nil
+	}
+	if !item.IsRead {
+		return state, false, nil
+	}
+	seenAt := now
+	if item.ReadAt != nil && !item.ReadAt.IsZero() {
+		seenAt = item.ReadAt.UTC()
+	}
+	if state.LastSeenAt.IsZero() || seenAt.After(state.LastSeenAt) {
+		state.LastSeenAt = seenAt
+	}
+	state.OutstandingMailboxID = 0
+	state.OutstandingMessageID = 0
+	state.StateHash = ""
+	return state, true, nil
+}
+
+func (s *Server) sendManagedKBUpdatedSummary(ctx context.Context, userID string, subject, body string) (int64, int64, error) {
+	result, err := s.store.SendMail(ctx, store.MailSendInput{
+		From:    clawWorldSystemID,
+		To:      []string{userID},
+		Subject: subject,
+		Body:    body,
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	s.pushUnreadMailHint(ctx, clawWorldSystemID, []string{userID}, subject)
+	mailboxIDs, _, err := s.resolveInboxMailboxIDsByMessageIDs(ctx, userID, []int64{result.MessageID})
+	if err != nil {
+		return result.MessageID, 0, err
+	}
+	var mailboxID int64
+	if len(mailboxIDs) > 0 {
+		mailboxID = mailboxIDs[0]
+	}
+	if mailboxID <= 0 {
+		return result.MessageID, 0, fmt.Errorf("mailbox_id not found for message %d", result.MessageID)
+	}
+	return result.MessageID, mailboxID, nil
+}
+
+func (s *Server) listAppliedKBUpdatedSummaryItems(ctx context.Context) []kbUpdatedSummaryItem {
+	proposals, err := s.store.ListKBProposals(ctx, "applied", 5000)
+	if err != nil {
+		return nil
+	}
+	bots, err := s.store.ListBots(ctx)
+	if err != nil {
+		return nil
+	}
+	displayNames := buildBotDisplayNameIndex(bots)
+	items := make([]kbUpdatedSummaryItem, 0, len(proposals))
+	for _, proposal := range proposals {
+		if proposal.AppliedAt == nil {
+			continue
 		}
 		change, err := s.store.GetKBProposalChange(ctx, proposal.ID)
 		if err != nil {
 			continue
 		}
 		entryTitle := ""
-		if strings.TrimSpace(change.Title) != "" {
-			entryTitle = change.Title
-		}
 		if change.TargetEntryID > 0 {
 			if entry, eerr := s.store.GetKBEntry(ctx, change.TargetEntryID); eerr == nil {
 				entryTitle = entry.Title
 			}
 		}
-		item := kbUpdatedSummaryItem{
-			ProposalID: proposal.ID,
-			Title:      proposal.Title,
-			Section:    change.Section,
-			EntryID:    change.TargetEntryID,
-			EntryTitle: entryTitle,
-			AppliedAt:  proposal.AppliedAt.UTC(),
+		if entryTitle == "" {
+			entryTitle = change.Title
 		}
-		for userID := range recipients {
-			uid := strings.TrimSpace(userID)
-			if uid == "" || isSystemRuntimeUserID(uid) {
-				continue
-			}
-			summaries[uid] = append(summaries[uid], item)
-		}
-	}
-	for userID, items := range summaries {
-		sort.SliceStable(items, func(i, j int) bool {
-			if items[i].AppliedAt.Equal(items[j].AppliedAt) {
-				return items[i].ProposalID < items[j].ProposalID
-			}
-			return items[i].AppliedAt.After(items[j].AppliedAt)
+		items = append(items, kbUpdatedSummaryItem{
+			ProposalID:       proposal.ID,
+			Title:            proposal.Title,
+			Summary:          deriveKBUpdatedSummaryText(proposal, change, entryTitle),
+			EntryID:          change.TargetEntryID,
+			ProposerUserID:   strings.TrimSpace(proposal.ProposerUserID),
+			ProposerUserName: strings.TrimSpace(displayNames[strings.TrimSpace(proposal.ProposerUserID)]),
+			OpType:           strings.TrimSpace(change.OpType),
+			Section:          strings.TrimSpace(change.Section),
+			AppliedAt:        proposal.AppliedAt.UTC(),
 		})
-		stateHash := kbUpdatedStateHash(items)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].AppliedAt.Equal(items[j].AppliedAt) {
+			return items[i].ProposalID < items[j].ProposalID
+		}
+		return items[i].AppliedAt.After(items[j].AppliedAt)
+	})
+	return items
+}
+
+func (s *Server) sendKBUpdatedSummaryMails(ctx context.Context) {
+	now := time.Now().UTC()
+	items := s.listAppliedKBUpdatedSummaryItems(ctx)
+	if len(items) == 0 {
+		return
+	}
+	for _, rawUserID := range s.activeUserIDs(ctx) {
+		userID := strings.TrimSpace(rawUserID)
+		if userID == "" || isSystemRuntimeUserID(userID) {
+			continue
+		}
 		state, ok, err := s.store.GetNotificationDeliveryState(ctx, userID, notificationCategoryKBUpdatedSummary)
 		if err != nil {
 			continue
 		}
-		send, nextState := shouldSendSummaryState(ok, state, stateHash, kbUpdatedSummaryInterval, kbUpdatedSummaryInterval, now)
-		if !send {
+		if !ok {
+			state = store.NotificationDeliveryState{
+				OwnerAddress: userID,
+				Category:     notificationCategoryKBUpdatedSummary,
+			}
+		}
+		state, normalized, err := s.normalizeKBUpdatedSummaryState(ctx, userID, state, now)
+		if err != nil {
 			continue
 		}
-		subject, body := buildKBUpdatedSummaryMail(items)
+		if normalized {
+			if _, err := s.store.UpsertNotificationDeliveryState(ctx, state); err != nil {
+				continue
+			}
+		}
+		boundary := kbUpdatedSeenBoundary(state, now)
+		pendingItems := kbUpdatedPendingItemsSince(items, boundary)
+		if len(pendingItems) == 0 {
+			continue
+		}
+		stateHash := kbUpdatedStateHash(pendingItems)
+		subject, body := buildKBUpdatedSummaryMail(pendingItems, now, boundary)
 		if subject == "" || body == "" {
 			continue
 		}
-		s.sendMailAndPushHint(ctx, clawWorldSystemID, []string{userID}, subject, body)
-		nextState.OwnerAddress = userID
-		nextState.Category = notificationCategoryKBUpdatedSummary
-		nextState.StateHash = stateHash
-		_, _ = s.store.UpsertNotificationDeliveryState(ctx, nextState)
+		if state.OutstandingMessageID > 0 && state.OutstandingMailboxID > 0 {
+			if state.StateHash == stateHash {
+				continue
+			}
+			if err := s.store.UpdateMailMessage(ctx, state.OutstandingMessageID, subject, body, now); err != nil {
+				continue
+			}
+			state.StateHash = stateHash
+			state.LastSentAt = now
+			state.LastRemindedAt = now
+			if _, err := s.store.UpsertNotificationDeliveryState(ctx, state); err == nil {
+				s.pushUnreadMailHint(ctx, clawWorldSystemID, []string{userID}, subject)
+			}
+			continue
+		}
+		if !kbUpdatedCanCreateFreshSummary(state, now) {
+			continue
+		}
+		messageID, mailboxID, err := s.sendManagedKBUpdatedSummary(ctx, userID, subject, body)
+		if err != nil {
+			continue
+		}
+		state.LastSeenAt = boundary
+		state.StateHash = stateHash
+		state.LastSentAt = now
+		state.LastRemindedAt = now
+		state.OutstandingMessageID = messageID
+		state.OutstandingMailboxID = mailboxID
+		_, _ = s.store.UpsertNotificationDeliveryState(ctx, state)
 	}
 }
 
@@ -8248,6 +8438,7 @@ func (s *Server) kbTick(ctx context.Context, tickID int64) {
 		s.sendKBPendingSummaryMails(ctx, nil)
 	}
 	s.kbFinalizeExpiredVotes(ctx)
+	s.sendKBUpdatedSummaryMails(ctx)
 }
 
 func (s *Server) genesisBootstrapSnapshotForProposal(ctx context.Context, proposalID int64) (genesisState, bool, error) {

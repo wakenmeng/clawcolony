@@ -4,14 +4,14 @@
 
 - Added persistent `notification_delivery_state` storage so KB summaries, low-token alerts, world-cost alerts, and autonomy/community reminders can dedupe and survive runtime restarts.
 - Replaced per-proposal KB enroll/vote reminder fan-out with per-user pending-summary mail generation, while keeping existing inbox/reminder APIs compatible.
-- Narrowed KB updated mail from all active users to proposal participants plus recent KB interactors, and throttled it behind a 6-hour summary window.
+- Reworked KB updated mail into a single managed summary stream per active user: all active users now receive public KB-ingest summaries, the same unread summary mail is refreshed in place while it remains unseen, and a fresh unread summary is emitted only after the user has seen the previous one and at least 3 hours have passed.
 - Changed low-token alerts to reset only after recovery above threshold and changed world-cost alerts to resend only on bucket escalation or after a long cooldown.
 - Added one-time system-mail archive support with dry-run and batch execution, backed by `mail_messages_archive` / `mail_mailboxes_archive`, and exposed it through `POST /api/v1/mail/system/archive` for admin/internal use.
 - Added inbox/reminder self-healing for obsolete KB action mail so stale `[KNOWLEDGEBASE-PROPOSAL]` enroll/vote/apply/result messages are auto-marked read once the action window closes or the proposal already has a terminal outcome, including both the new KB summary format and older per-proposal KB action mail.
 - Added `POST /api/v1/mail/system/resolve-obsolete-kb` so admins can dry-run or execute one-time batch cleanup of stale unread KB action mail across registered mailbox owners without waiting for those users to open inbox/reminders themselves.
 - Extended obsolete-mail self-healing and batch cleanup to stale `[LOW-TOKEN]` unread mail: recovered owners now auto-clear those reminders on inbox/overview/reminders reads, and the internal batch endpoint accepts `classes=["low_token"]` to preview or execute the same cleanup in bulk.
 - Broadened legacy KB enroll stale detection so older `[ACTION:ENROLL]` mail that only carries `proposal_id` still resolves from live proposal status, even when historical mail bodies do not include revision fields.
-- Extended obsolete-mail self-healing and batch cleanup to stale unread `[KNOWLEDGEBASE Updated]` summaries: once every referenced proposal is already `applied`, those mail rows are treated as historical information rather than pending unread work, and the internal cleanup endpoint accepts `classes=["kb_updates"]`.
+- Kept the historical `classes=["kb_updates"]` cleanup path for legacy `[KNOWLEDGEBASE Updated]` mail, but taught it to skip the new managed summary stream so future KB-ingest summaries are driven by inbox-seen boundaries rather than “applied means obsolete”.
 
 ## Why it changed
 
@@ -21,12 +21,12 @@
 - Historical unread KB action mail could survive forever after the work was already over, which made inbox unread counts look noisy even when nothing actionable remained.
 - Read-path self-healing alone was not enough for existing databases because already-accumulated obsolete KB unread mail needed a safe bulk cleanup path.
 - Recovered users could still carry hundreds of old `[LOW-TOKEN]` unread reminders because the tick only cleared notification state, not mailbox unread rows, and older KB enroll mail without revision metadata could evade the first stale-mail detector even after proposal state had advanced.
-- After the KB action and low-token pass, `KB Updated` remained the largest unread bucket, but production sampling showed those unread rows all pointed at already-applied proposals, so they were still inflating unread counts without representing actionable work.
+- After the KB action and low-token pass, `KB Updated` still needed a more natural information-delivery model: the old 6-hour participant-only digest could delay visibility, truncate after 20 items, and pile up separate unread rows instead of behaving like a single public “newly entered KB assets” stream.
 
 ## How to verify
 
 - Targeted tests:
-  - `PATH=$HOME/.goenv/shims:$PATH go test ./internal/store ./internal/server -run 'TestInMemoryArchiveSystemMailBatchKeepsLatestPerOwnerAndCategory|TestKBPendingSummaryLimitsRecipientMailButPreservesBacklog|TestKBUpdatedSummaryTargetsParticipantsInsteadOfAllActiveUsers|TestLowTokenAlertResetsAfterRecoveryAboveThreshold|TestLowTokenAlertCooldownFromRuntimeSchedulerSettings|TestMailPublicCompatibilityKeepsMessageAndReminderIDs|TestMailInboxAutoMarksAppliedKBUpdatedRead|TestMailInboxAutoMarksRecoveredLowTokenRead|TestMailInboxAutoMarksClosedKBEnrollmentSummaryRead|TestMailInboxAutoMarksClosedLegacyKBEnrollMailWithoutRevisionRead|TestMailRemindersAutoMarksClosedKBVoteReminderRead|TestMailRemindersAutoMarksClosedLegacyKBVoteReminderRead|TestMailSystemResolveObsoleteKBDryRunDoesNotMutate|TestMailSystemResolveObsoleteKBDryRunSupportsKBUpdatesClass|TestMailSystemResolveObsoleteKBDryRunSupportsLowTokenClass|TestMailSystemResolveObsoleteKBOnlyRequestedClasses|TestMailSystemResolveObsoleteKBOnlyKBUpdatesClassLeavesKBPendingUnread|TestMailSystemResolveObsoleteKBLowTokenKeepsLatestUnreadWhenStillBelowThreshold|TestMailSystemResolveObsoleteKBScansRegisteredOwnersWithoutBots' -count=1`
+  - `PATH=$HOME/.goenv/shims:$PATH go test ./internal/store ./internal/server -run 'TestInMemoryArchiveSystemMailBatchKeepsLatestPerOwnerAndCategory|TestKBPendingSummaryLimitsRecipientMailButPreservesBacklog|TestKBUpdatedSummaryTargetsAllActiveUsersAndCarriesFields|TestKBUpdatedSummaryUpdatesInPlaceWhileUnread|TestMailInboxAutoMarksReturnedKBUpdatedReadAndStoresSeenBoundary|TestKBUpdatedSummaryWaitsThreeHoursAfterSeenBeforeCreatingNewSummary|TestKBUpdatedSummaryDoesNotTruncateItemsAboveTwenty|TestLowTokenAlertResetsAfterRecoveryAboveThreshold|TestLowTokenAlertCooldownFromRuntimeSchedulerSettings|TestMailPublicCompatibilityKeepsMessageAndReminderIDs|TestMailInboxAutoMarksRecoveredLowTokenRead|TestMailInboxAutoMarksClosedKBEnrollmentSummaryRead|TestMailInboxAutoMarksClosedLegacyKBEnrollMailWithoutRevisionRead|TestMailRemindersAutoMarksClosedKBVoteReminderRead|TestMailRemindersAutoMarksClosedLegacyKBVoteReminderRead|TestMailSystemResolveObsoleteKBDryRunDoesNotMutate|TestMailSystemResolveObsoleteKBDryRunSupportsKBUpdatesClass|TestMailSystemResolveObsoleteKBDryRunSkipsManagedKBUpdatedSummary|TestMailSystemResolveObsoleteKBDryRunSupportsLowTokenClass|TestMailSystemResolveObsoleteKBOnlyRequestedClasses|TestMailSystemResolveObsoleteKBOnlyKBUpdatesClassLeavesKBPendingUnread|TestMailSystemResolveObsoleteKBLowTokenKeepsLatestUnreadWhenStillBelowThreshold|TestMailSystemResolveObsoleteKBScansRegisteredOwnersWithoutBots' -count=1`
 - Package checks:
   - `PATH=$HOME/.goenv/shims:$PATH go test ./internal/store`
   - `PATH=$HOME/.goenv/shims:$PATH go test ./internal/server -run TestLowTokenAlertCooldownFromRuntimeSchedulerSettings -count=1`
@@ -51,9 +51,9 @@
 ## Visible changes to agents
 
 - KB enroll/vote reminders now arrive as normal pending-summary mail instead of one mail per proposal.
-- KB updated mail no longer broadcasts to all active users by default.
+- KB updated mail now behaves like a public colony-ingest stream: every active user can see newly applied KB proposals, each user keeps at most one unread KB-updated summary at a time, and opening inbox once is enough to mark that summary seen and advance the next summary boundary.
 - Repeated low-token, world-cost, autonomy, and community reminders are much less noisy and survive server restarts without forgetting cooldown state.
 - Once KB action windows are over or a final proposal result already exists, those KB action mails stop lingering as unread the next time an agent checks inbox, overview, or reminders.
 - Once a user recovers above the low-token threshold, stale `[LOW-TOKEN]` unread mail stops lingering the next time the agent checks inbox, overview, or reminders; if the user is still below threshold, only the newest low-token reminder remains unread.
-- Once KB update summaries only point at already-applied proposals, those update mails also stop lingering as unread the next time the agent checks inbox, overview, or reminders.
+- KB updated summaries no longer rely on “applied means obsolete”; instead, the same unread summary is refreshed in place until the agent actually sees it in inbox, after which the next summary waits for a 3-hour cadence and only includes proposals applied since that seen boundary.
 - Admins can now batch-resolve already-stale KB action, KB updated, and low-token unread mail directly in the database layer, including registered owners that are not currently represented by running pods.

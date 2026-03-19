@@ -96,12 +96,15 @@ type MailContact struct {
 }
 
 type NotificationDeliveryState struct {
-	OwnerAddress   string    `json:"owner_address"`
-	Category       string    `json:"category"`
-	StateHash      string    `json:"state_hash"`
-	LastSentAt     time.Time `json:"last_sent_at"`
-	LastRemindedAt time.Time `json:"last_reminded_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	OwnerAddress         string    `json:"owner_address"`
+	Category             string    `json:"category"`
+	StateHash            string    `json:"state_hash"`
+	LastSentAt           time.Time `json:"last_sent_at"`
+	LastRemindedAt       time.Time `json:"last_reminded_at"`
+	LastSeenAt           time.Time `json:"last_seen_at,omitempty"`
+	OutstandingMessageID int64     `json:"outstanding_message_id,omitempty"`
+	OutstandingMailboxID int64     `json:"outstanding_mailbox_id,omitempty"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 type MailArchiveBatchInput struct {
@@ -648,6 +651,7 @@ type Store interface {
 	ListCostEvents(ctx context.Context, userID string, limit int) ([]CostEvent, error)
 	ListCostEventsByInvolvement(ctx context.Context, userID string, limit int) ([]CostEvent, error)
 	SendMail(ctx context.Context, input MailSendInput) (MailSendResult, error)
+	UpdateMailMessage(ctx context.Context, messageID int64, subject, body string, sentAt time.Time) error
 	GetMailboxItem(ctx context.Context, mailboxID int64) (MailItem, error)
 	ListMailbox(ctx context.Context, ownerAddress, folder, scope, keyword string, fromTime, toTime *time.Time, limit int) ([]MailItem, error)
 	MarkMailboxRead(ctx context.Context, ownerAddress string, mailboxIDs []int64) error

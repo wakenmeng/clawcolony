@@ -293,9 +293,15 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			state_hash TEXT NOT NULL DEFAULT '',
 			last_sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			last_reminded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			last_seen_at TIMESTAMPTZ NULL,
+			outstanding_message_id BIGINT NOT NULL DEFAULT 0,
+			outstanding_mailbox_id BIGINT NOT NULL DEFAULT 0,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			PRIMARY KEY(owner_address, category)
 		)`,
+		`ALTER TABLE notification_delivery_state ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NULL`,
+		`ALTER TABLE notification_delivery_state ADD COLUMN IF NOT EXISTS outstanding_message_id BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE notification_delivery_state ADD COLUMN IF NOT EXISTS outstanding_mailbox_id BIGINT NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_notification_delivery_state_category ON notification_delivery_state(category, updated_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS mail_contacts (
 			owner_address TEXT NOT NULL,
@@ -1717,6 +1723,20 @@ func (s *PostgresStore) MarkMailboxRead(ctx context.Context, ownerAddress string
 	return err
 }
 
+func (s *PostgresStore) UpdateMailMessage(ctx context.Context, messageID int64, subject, body string, sentAt time.Time) error {
+	if messageID <= 0 {
+		return fmt.Errorf("message_id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE mail_messages
+		SET subject = $2,
+		    body = $3,
+		    sent_at = $4
+		WHERE id = $1
+	`, messageID, strings.TrimSpace(subject), strings.TrimSpace(body), sentAt.UTC())
+	return err
+}
+
 func normalizedArchiveCategories(categories []string) []string {
 	seen := make(map[string]struct{}, len(categories))
 	out := make([]string, 0, len(categories))
@@ -1775,8 +1795,10 @@ func (s *PostgresStore) GetNotificationDeliveryState(ctx context.Context, ownerA
 		return NotificationDeliveryState{}, false, nil
 	}
 	var state NotificationDeliveryState
+	var lastSeenAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
-		SELECT owner_address, category, state_hash, last_sent_at, last_reminded_at, updated_at
+		SELECT owner_address, category, state_hash, last_sent_at, last_reminded_at, last_seen_at,
+		       outstanding_message_id, outstanding_mailbox_id, updated_at
 		FROM notification_delivery_state
 		WHERE owner_address = $1 AND category = $2
 	`, ownerAddress, category).Scan(
@@ -1785,6 +1807,9 @@ func (s *PostgresStore) GetNotificationDeliveryState(ctx context.Context, ownerA
 		&state.StateHash,
 		&state.LastSentAt,
 		&state.LastRemindedAt,
+		&lastSeenAt,
+		&state.OutstandingMessageID,
+		&state.OutstandingMailboxID,
 		&state.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -1792,6 +1817,9 @@ func (s *PostgresStore) GetNotificationDeliveryState(ctx context.Context, ownerA
 	}
 	if err != nil {
 		return NotificationDeliveryState{}, false, err
+	}
+	if lastSeenAt.Valid {
+		state.LastSeenAt = lastSeenAt.Time.UTC()
 	}
 	return state, true, nil
 }
@@ -1802,25 +1830,41 @@ func (s *PostgresStore) UpsertNotificationDeliveryState(ctx context.Context, sta
 	if state.OwnerAddress == "" || state.Category == "" {
 		return NotificationDeliveryState{}, fmt.Errorf("owner_address and category are required")
 	}
+	var lastSeenAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
-		INSERT INTO notification_delivery_state(owner_address, category, state_hash, last_sent_at, last_reminded_at, updated_at)
-		VALUES($1, $2, $3, COALESCE($4, NOW()), COALESCE($5, NOW()), NOW())
+		INSERT INTO notification_delivery_state(
+			owner_address, category, state_hash, last_sent_at, last_reminded_at, last_seen_at,
+			outstanding_message_id, outstanding_mailbox_id, updated_at
+		)
+		VALUES($1, $2, $3, COALESCE($4, NOW()), COALESCE($5, NOW()), $6, $7, $8, NOW())
 		ON CONFLICT (owner_address, category) DO UPDATE SET
 			state_hash = EXCLUDED.state_hash,
 			last_sent_at = EXCLUDED.last_sent_at,
 			last_reminded_at = EXCLUDED.last_reminded_at,
+			last_seen_at = EXCLUDED.last_seen_at,
+			outstanding_message_id = EXCLUDED.outstanding_message_id,
+			outstanding_mailbox_id = EXCLUDED.outstanding_mailbox_id,
 			updated_at = NOW()
-		RETURNING owner_address, category, state_hash, last_sent_at, last_reminded_at, updated_at
-	`, state.OwnerAddress, state.Category, state.StateHash, nullIfZeroTime(state.LastSentAt), nullIfZeroTime(state.LastRemindedAt)).Scan(
+		RETURNING owner_address, category, state_hash, last_sent_at, last_reminded_at, last_seen_at,
+		          outstanding_message_id, outstanding_mailbox_id, updated_at
+	`, state.OwnerAddress, state.Category, state.StateHash, nullIfZeroTime(state.LastSentAt), nullIfZeroTime(state.LastRemindedAt), nullIfZeroTime(state.LastSeenAt), state.OutstandingMessageID, state.OutstandingMailboxID).Scan(
 		&state.OwnerAddress,
 		&state.Category,
 		&state.StateHash,
 		&state.LastSentAt,
 		&state.LastRemindedAt,
+		&lastSeenAt,
+		&state.OutstandingMessageID,
+		&state.OutstandingMailboxID,
 		&state.UpdatedAt,
 	)
 	if err != nil {
 		return NotificationDeliveryState{}, err
+	}
+	if lastSeenAt.Valid {
+		state.LastSeenAt = lastSeenAt.Time.UTC()
+	} else {
+		state.LastSeenAt = time.Time{}
 	}
 	return state, nil
 }

@@ -833,6 +833,32 @@ func (s *InMemoryStore) MarkMailboxRead(_ context.Context, ownerAddress string, 
 	return nil
 }
 
+func (s *InMemoryStore) UpdateMailMessage(_ context.Context, messageID int64, subject, body string, sentAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if messageID <= 0 {
+		return fmt.Errorf("message_id is required")
+	}
+	updated := false
+	subject = strings.TrimSpace(subject)
+	body = strings.TrimSpace(body)
+	sentAt = sentAt.UTC()
+	for i, item := range s.mailbox {
+		if item.MessageID != messageID {
+			continue
+		}
+		item.Subject = subject
+		item.Body = body
+		item.SentAt = sentAt
+		s.mailbox[i] = item
+		updated = true
+	}
+	if !updated {
+		return fmt.Errorf("mail message not found: %d", messageID)
+	}
+	return nil
+}
+
 func notificationStateKey(ownerAddress, category string) string {
 	return strings.TrimSpace(ownerAddress) + "\x00" + strings.TrimSpace(category)
 }
