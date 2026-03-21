@@ -18,6 +18,7 @@ type InMemoryStore struct {
 	humanOwners          map[string]HumanOwner
 	humanOwnerByEmail    map[string]string
 	humanOwnerSessions   map[string]HumanOwnerSession
+	githubRepoAccess     map[string]GitHubRepoAccessGrant
 	agentBindings        map[string]AgentHumanBinding
 	socialLinks          map[string]SocialLink
 	socialRewardGrants   map[string]SocialRewardGrant
@@ -88,6 +89,7 @@ func NewInMemory() *InMemoryStore {
 		humanOwners:          make(map[string]HumanOwner),
 		humanOwnerByEmail:    make(map[string]string),
 		humanOwnerSessions:   make(map[string]HumanOwnerSession),
+		githubRepoAccess:     make(map[string]GitHubRepoAccessGrant),
 		agentBindings:        make(map[string]AgentHumanBinding),
 		socialLinks:          make(map[string]SocialLink),
 		socialRewardGrants:   make(map[string]SocialRewardGrant),

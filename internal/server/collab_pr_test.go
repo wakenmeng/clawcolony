@@ -164,6 +164,15 @@ func TestCollabUpgradePRAuthorLedUpdateAndApplyFlow(t *testing.T) {
 	proposer := newAuthUser(t, srv)
 	reviewer := newAuthUser(t, srv)
 	outsider := newAuthUser(t, srv)
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: proposer.id, GitHubUsername: "author-login"}); err != nil {
+		t.Fatalf("upsert proposer github username: %v", err)
+	}
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: reviewer.id, GitHubUsername: "reviewer-one"}); err != nil {
+		t.Fatalf("upsert reviewer github username: %v", err)
+	}
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: outsider.id, GitHubUsername: "outsider-login"}); err != nil {
+		t.Fatalf("upsert outsider github username: %v", err)
+	}
 	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 42)
 	fixture.pull = githubPullRequestRecord{
 		Number:  42,
@@ -245,22 +254,24 @@ func TestCollabUpgradePRAuthorLedUpdateAndApplyFlow(t *testing.T) {
 		t.Fatalf("upgrade_pr should not allow rebinding to another PR, got=%d body=%s", rebound.Code, rebound.Body.String())
 	}
 
-	fixture.comments[9001] = makeUpgradePRApplyComment(fixturesRepoOrDefault(fixture.repo), fixture.number, 9001, "reviewer-one", upgrade.CollabID, reviewer.id, "I can review this change.")
+	fixture.reviews = []githubPullReviewRecord{
+		makeUpgradePRAppliedReview(9001, "reviewer-one", reviewer.id, "APPROVED", upgrade.CollabID, fixture.pull.Head.SHA, "agree", "looks good", "none", time.Now().Add(-1*time.Minute)),
+	}
 	badApply := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/apply", map[string]any{
 		"collab_id":        upgrade.CollabID,
 		"application_kind": "review",
-		"evidence_url":     fixture.commentURL(9001),
+		"evidence_url":     fixture.reviewURL(9001),
 	}, outsider.headers())
-	if badApply.Code != http.StatusBadRequest || !strings.Contains(badApply.Body.String(), "user_id does not match") {
+	if badApply.Code != http.StatusBadRequest || (!strings.Contains(badApply.Body.String(), "github login does not match") && !strings.Contains(badApply.Body.String(), "user_id does not match")) {
 		t.Fatalf("review apply with mismatched user should fail, got=%d body=%s", badApply.Code, badApply.Body.String())
 	}
 
-	reviewApply := applyUpgradePRReviewForTest(t, srv, reviewer, upgrade.CollabID, fixture.commentURL(9001))
+	reviewApply := applyUpgradePRReviewForTest(t, srv, reviewer, upgrade.CollabID, fixture.reviewURL(9001))
 	if !reviewApply.Verified || reviewApply.ApplicationKind != "review" || reviewApply.GitHubLogin != "reviewer-one" {
 		t.Fatalf("review apply should capture verification details, got=%+v", reviewApply)
 	}
-	if reviewApply.Pitch != "I can review this change." {
-		t.Fatalf("review apply pitch should come from comment note, got=%q", reviewApply.Pitch)
+	if reviewApply.Pitch != "looks good" {
+		t.Fatalf("review apply pitch should come from review summary, got=%q", reviewApply.Pitch)
 	}
 
 	discussionApply := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/apply", map[string]any{

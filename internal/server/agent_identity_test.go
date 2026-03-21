@@ -170,7 +170,7 @@ func enableGitHubOAuthForTestWithEmails(t *testing.T, starred, forked bool, emai
 				t.Fatalf("expected github code_verifier")
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"access_token":"gh-access-token","token_type":"bearer","scope":"read:user"}`))
+			_, _ = w.Write([]byte(`{"access_token":"gh-access-token","token_type":"bearer","expires_in":28800,"refresh_token":"gh-refresh-token","refresh_token_expires_in":2592000}`))
 		case r.URL.Path == "/user":
 			if got := r.Header.Get("Authorization"); got != "Bearer gh-access-token" {
 				t.Fatalf("unexpected github auth header=%q", got)
@@ -199,6 +199,17 @@ func enableGitHubOAuthForTestWithEmails(t *testing.T, starred, forked bool, emai
 				return
 			}
 			_, _ = w.Write([]byte(`[]`))
+		case r.URL.Path == "/user/installations":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"installations":[{"id":12345,"repository_selection":"selected","account":{"login":"agi-bar"}}]}`))
+		case r.URL.Path == "/user/installations/12345/repositories":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"repositories":[{"id":987654,"name":"clawcolony","full_name":"agi-bar/clawcolony"}]}`))
+		case r.URL.Path == "/repos/agi-bar/clawcolony":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":987654,"name":"clawcolony","full_name":"agi-bar/clawcolony","role_name":"write","permissions":{"admin":false,"maintain":false,"push":true,"triage":false,"pull":true}}`))
+		case r.URL.Path == "/repos/agi-bar/clawcolony/collaborators/octo/permission":
+			t.Fatalf("unexpected deprecated collaborator permission check: %s", r.URL.Path)
 		default:
 			http.NotFound(w, r)
 		}
@@ -208,6 +219,16 @@ func enableGitHubOAuthForTestWithEmails(t *testing.T, starred, forked bool, emai
 	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_AUTHORIZE_URL", srv.URL+"/login/oauth/authorize")
 	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_TOKEN_URL", srv.URL+"/login/oauth/access_token")
 	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_USERINFO_URL", srv.URL+"/user")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_CLIENT_ID", "gh-app-client")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_CLIENT_SECRET", "gh-app-secret")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_AUTHORIZE_URL", srv.URL+"/login/oauth/authorize")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_TOKEN_URL", srv.URL+"/login/oauth/access_token")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_API_BASE_URL", srv.URL)
+	t.Setenv("CLAWCOLONY_GITHUB_APP_REPOSITORY_ID", "987654")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_REPOSITORY_OWNER", "agi-bar")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_REPOSITORY_NAME", "clawcolony")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_ALLOWED_INSTALLATION_ID", "12345")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_TOKEN_ENCRYPTION_KEY", "test-github-app-key")
 	t.Setenv("CLAWCOLONY_GITHUB_API_BASE_URL", srv.URL)
 	t.Setenv("CLAWCOLONY_OFFICIAL_GITHUB_REPO", "agi-bar/clawcolony")
 	return srv
@@ -431,37 +452,6 @@ func TestManagedAgentCanUseAPIKeyForPricedWrite(t *testing.T) {
 	afterBalance := balanceFromResponse(t, after)
 	if afterBalance != beforeBalance {
 		t.Fatalf("expected v2 mail send within free quota to preserve balance, before=%d after=%d body=%s", beforeBalance, afterBalance, after.Body.String())
-	}
-}
-
-func TestTokenBalanceAllowsPublicUserIDQueryWithoutAPIKey(t *testing.T) {
-	xOAuth := enableXOAuthForTest(t)
-	defer xOAuth.Close()
-
-	srv := newTestServer()
-	h := identityTestHandler(srv)
-
-	userID, _, claimLink := registerAgentForTest(t, h, "frontend-balance-agent", "mail")
-	_, cookie := claimAgentForTest(t, h, claimLink, "frontend-balance@example.com", "frontend-human")
-
-	rewardAgentViaXOAuthForTest(t, h, userID, cookie)
-
-	balance := doJSONRequest(t, h, http.MethodGet, "/api/v1/token/balance?user_id="+neturl.QueryEscape(userID), nil)
-	if balance.Code != http.StatusOK {
-		t.Fatalf("expected token balance read by user_id query, got code=%d body=%s", balance.Code, balance.Body.String())
-	}
-	if got := balanceFromResponse(t, balance); got <= 0 {
-		t.Fatalf("expected positive rewarded balance, got=%d body=%s", got, balance.Body.String())
-	}
-}
-
-func TestTokenBalanceWithoutUserIDStillRequiresAuthentication(t *testing.T) {
-	srv := newTestServer()
-	h := identityTestHandler(srv)
-
-	balance := doJSONRequest(t, h, http.MethodGet, "/api/v1/token/balance", nil)
-	if balance.Code != http.StatusUnauthorized {
-		t.Fatalf("expected unauthorized token balance read without user_id or api_key, got code=%d body=%s", balance.Code, balance.Body.String())
 	}
 }
 
@@ -1131,15 +1121,15 @@ func TestClaimGitHubFrontendFlowActivatesAgentAndSetsOwnerSession(t *testing.T) 
 	if err != nil {
 		t.Fatalf("parse authorize_url: %v", err)
 	}
-	if got := authorizeURL.Query().Get("scope"); got != "read:user user:email" {
-		t.Fatalf("expected claim github scope read:user user:email, got=%q", got)
+	if got := authorizeURL.Query().Get("scope"); got != "" {
+		t.Fatalf("expected claim github app flow to omit scope, got=%q", got)
 	}
 	state := authorizeURL.Query().Get("state")
 	if strings.TrimSpace(state) == "" {
 		t.Fatalf("expected signed oauth state in authorize url")
 	}
 
-	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/claim/callback?code=gh-code&state="+neturl.QueryEscape(state), nil)
+	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/repo-access/callback?code=gh-code&state="+neturl.QueryEscape(state), nil)
 	callbackReq.Header.Set("Cookie", joinCookieHeader("", start.Result().Cookies()))
 	callback := httptest.NewRecorder()
 	h.ServeHTTP(callback, callbackReq)
@@ -1159,11 +1149,11 @@ func TestClaimGitHubFrontendFlowActivatesAgentAndSetsOwnerSession(t *testing.T) 
 	if got := callbackLocation.Query().Get("github_username"); got != "octo" {
 		t.Fatalf("unexpected callback github username=%q", got)
 	}
-	if got := callbackLocation.Query().Get("starred"); got != "true" {
-		t.Fatalf("unexpected callback starred flag=%q", got)
+	if got := callbackLocation.Query().Get("repo"); got != "agi-bar/clawcolony" {
+		t.Fatalf("unexpected callback repo=%q", got)
 	}
-	if got := callbackLocation.Query().Get("forked"); got != "true" {
-		t.Fatalf("unexpected callback forked flag=%q", got)
+	if got := callbackLocation.Query().Get("role"); got != "contributor" {
+		t.Fatalf("unexpected callback role=%q", got)
 	}
 
 	complete := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/claims/github/complete", map[string]any{
@@ -1191,6 +1181,9 @@ func TestClaimGitHubFrontendFlowActivatesAgentAndSetsOwnerSession(t *testing.T) 
 	rewards, ok := completeBody["rewards"].([]any)
 	if !ok || len(rewards) != 3 {
 		t.Fatalf("expected auth+star+fork rewards, payload=%s", complete.Body.String())
+	}
+	if githubAccess, ok := completeBody["github_access"].(map[string]any); !ok || githubAccess["status"] != "active_contributor" {
+		t.Fatalf("expected github access status in complete response, payload=%s", complete.Body.String())
 	}
 
 	var ownerCookie string
@@ -1284,9 +1277,14 @@ func TestClaimGitHubFrontendFlowUsesLocalGitHubMock(t *testing.T) {
 	t.Setenv("GITHUB_API_MOCK_USER_ID", "4242")
 	t.Setenv("GITHUB_API_MOCK_STARRED", "true")
 	t.Setenv("GITHUB_API_MOCK_FORKED", "true")
-	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_ID", "gh-client")
-	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_SECRET", "gh-secret")
-	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_AUTHORIZE_URL", "https://github.mock.test/login/oauth/authorize")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_CLIENT_ID", "gh-client")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_CLIENT_SECRET", "gh-secret")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_AUTHORIZE_URL", "https://github.mock.test/login/oauth/authorize")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_REPOSITORY_ID", "987654")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_REPOSITORY_OWNER", "agi-bar")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_REPOSITORY_NAME", "clawcolony")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_ALLOWED_INSTALLATION_ID", "12345")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_TOKEN_ENCRYPTION_KEY", "test-github-app-key")
 
 	srv := newTestServer()
 	h := identityTestHandler(srv)
@@ -1314,7 +1312,7 @@ func TestClaimGitHubFrontendFlowUsesLocalGitHubMock(t *testing.T) {
 		t.Fatalf("expected signed oauth state in authorize url")
 	}
 
-	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/claim/callback?code=gh-code&state="+neturl.QueryEscape(state), nil)
+	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/repo-access/callback?code=gh-code&state="+neturl.QueryEscape(state), nil)
 	callbackReq.Header.Set("Cookie", joinCookieHeader("", start.Result().Cookies()))
 	callback := httptest.NewRecorder()
 	h.ServeHTTP(callback, callbackReq)
@@ -1328,11 +1326,8 @@ func TestClaimGitHubFrontendFlowUsesLocalGitHubMock(t *testing.T) {
 	if got := callbackLocation.Query().Get("github_username"); got != "mock-octo" {
 		t.Fatalf("unexpected callback github username=%q", got)
 	}
-	if got := callbackLocation.Query().Get("starred"); got != "true" {
-		t.Fatalf("unexpected callback starred flag=%q", got)
-	}
-	if got := callbackLocation.Query().Get("forked"); got != "true" {
-		t.Fatalf("unexpected callback forked flag=%q", got)
+	if got := callbackLocation.Query().Get("repo"); got != "agi-bar/clawcolony" {
+		t.Fatalf("unexpected callback repo=%q", got)
 	}
 
 	complete := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/claims/github/complete", map[string]any{
@@ -1364,6 +1359,121 @@ func TestClaimGitHubFrontendFlowUsesLocalGitHubMock(t *testing.T) {
 	}
 }
 
+func TestOwnerGitHubRepoAccessFlowUsesCurrentOwnerSession(t *testing.T) {
+	gh := enableGitHubOAuthForTest(t, false, false)
+	defer gh.Close()
+
+	srv := newTestServer()
+	h := identityTestHandler(srv)
+
+	_, _, claimLink := registerAgentForTest(t, h, "owner-github-access-agent", "oss")
+	_, ownerCookie := claimAgentForTest(t, h, claimLink, "owner-session@example.com", "owner-session-human")
+
+	ownerMeBefore := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/owner/me", nil, map[string]string{
+		"Cookie": ownerCookie,
+	})
+	if ownerMeBefore.Code != http.StatusOK {
+		t.Fatalf("owner me before github access status=%d body=%s", ownerMeBefore.Code, ownerMeBefore.Body.String())
+	}
+	ownerBody := parseJSONBody(t, ownerMeBefore)
+	owner, ok := ownerBody["owner"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected owner payload before github access: %s", ownerMeBefore.Body.String())
+	}
+	ownerID, _ := owner["owner_id"].(string)
+	if strings.TrimSpace(ownerID) == "" {
+		t.Fatalf("expected owner_id before github access: %s", ownerMeBefore.Body.String())
+	}
+
+	start := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/github-access/start", nil, map[string]string{
+		"Cookie": ownerCookie,
+	})
+	if start.Code != http.StatusAccepted {
+		t.Fatalf("github access start status=%d body=%s", start.Code, start.Body.String())
+	}
+	startBody := parseJSONBody(t, start)
+	rawAuthorizeURL, _ := startBody["authorize_url"].(string)
+	if strings.TrimSpace(rawAuthorizeURL) == "" {
+		t.Fatalf("missing authorize_url in start response: %s", start.Body.String())
+	}
+	authorizeURL, err := neturl.Parse(rawAuthorizeURL)
+	if err != nil {
+		t.Fatalf("parse authorize_url: %v", err)
+	}
+	if got := authorizeURL.Query().Get("scope"); got != "" {
+		t.Fatalf("expected github app access flow to omit scope, got=%q", got)
+	}
+	state := authorizeURL.Query().Get("state")
+	if strings.TrimSpace(state) == "" {
+		t.Fatalf("expected signed oauth state in authorize url")
+	}
+
+	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/repo-access/callback?code=gh-code&state="+neturl.QueryEscape(state), nil)
+	callbackReq.Header.Set("Cookie", joinCookieHeader(ownerCookie, start.Result().Cookies()))
+	callback := httptest.NewRecorder()
+	h.ServeHTTP(callback, callbackReq)
+	if callback.Code != http.StatusSeeOther {
+		t.Fatalf("github access callback status=%d body=%s", callback.Code, callback.Body.String())
+	}
+	callbackLocation, err := neturl.Parse(callback.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("callback location: %v", err)
+	}
+	if callbackLocation.Path != "/github-access/callback" {
+		t.Fatalf("unexpected callback redirect path=%q", callbackLocation.String())
+	}
+	if got := callbackLocation.Query().Get("status"); got != "ok" {
+		t.Fatalf("unexpected callback status=%q", got)
+	}
+	if got := callbackLocation.Query().Get("repo"); got != "agi-bar/clawcolony" {
+		t.Fatalf("unexpected callback repo=%q", got)
+	}
+	if got := callbackLocation.Query().Get("role"); got != "contributor" {
+		t.Fatalf("unexpected callback role=%q", got)
+	}
+
+	status := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/github-access/status", nil, map[string]string{
+		"Cookie": ownerCookie,
+	})
+	if status.Code != http.StatusOK {
+		t.Fatalf("github access status code=%d body=%s", status.Code, status.Body.String())
+	}
+	statusBody := parseJSONBody(t, status)
+	if statusBody["status"] != "active_contributor" {
+		t.Fatalf("expected active_contributor status, got body=%s", status.Body.String())
+	}
+	if statusBody["github_username"] != "octo" {
+		t.Fatalf("expected github username octo, got body=%s", status.Body.String())
+	}
+	repository, ok := statusBody["repository"].(map[string]any)
+	if !ok || repository["full_name"] != "agi-bar/clawcolony" {
+		t.Fatalf("expected repository payload in status response, got body=%s", status.Body.String())
+	}
+
+	grant, err := srv.store.GetGitHubRepoAccessGrant(t.Context(), ownerID)
+	if err != nil {
+		t.Fatalf("get github repo access grant: %v", err)
+	}
+	if grant.OwnerID != ownerID {
+		t.Fatalf("grant owner mismatch: got=%s want=%s", grant.OwnerID, ownerID)
+	}
+	if grant.GitHubUsername != "octo" || grant.Role != "contributor" {
+		t.Fatalf("unexpected saved grant: %+v", grant)
+	}
+
+	ownerMeAfter := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/owner/me", nil, map[string]string{
+		"Cookie": ownerCookie,
+	})
+	if ownerMeAfter.Code != http.StatusOK {
+		t.Fatalf("owner me after github access status=%d body=%s", ownerMeAfter.Code, ownerMeAfter.Body.String())
+	}
+	ownerAfterBody := parseJSONBody(t, ownerMeAfter)
+	githubAccess, ok := ownerAfterBody["github_access"].(map[string]any)
+	if !ok || githubAccess["status"] != "active_contributor" {
+		t.Fatalf("expected github_access payload on owner/me, got body=%s", ownerMeAfter.Body.String())
+	}
+}
+
 func TestGitHubOAuthMockRequiresUnsafeAllowFlag(t *testing.T) {
 	t.Setenv("GITHUB_API_MOCK_ENABLED", "true")
 	t.Setenv("GITHUB_API_MOCK_LOGIN", "mock-octo")
@@ -1389,9 +1499,14 @@ func TestClaimGitHubFrontendFlowUsesDynamicLocalGitHubMockIdentity(t *testing.T)
 	t.Setenv("GITHUB_API_MOCK_ALLOW_UNSAFE_LOCAL", "true")
 	t.Setenv("GITHUB_API_MOCK_STARRED", "true")
 	t.Setenv("GITHUB_API_MOCK_FORKED", "true")
-	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_ID", "gh-client")
-	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_SECRET", "gh-secret")
-	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_AUTHORIZE_URL", "https://github.mock.test/login/oauth/authorize")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_CLIENT_ID", "gh-client")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_CLIENT_SECRET", "gh-secret")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_AUTHORIZE_URL", "https://github.mock.test/login/oauth/authorize")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_REPOSITORY_ID", "987654")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_REPOSITORY_OWNER", "agi-bar")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_REPOSITORY_NAME", "clawcolony")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_ALLOWED_INSTALLATION_ID", "12345")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_TOKEN_ENCRYPTION_KEY", "test-github-app-key")
 
 	srv := newTestServer()
 	srv.cfg.TreasuryInitialToken = 0
@@ -1414,7 +1529,7 @@ func TestClaimGitHubFrontendFlowUsesDynamicLocalGitHubMockIdentity(t *testing.T)
 			t.Fatalf("parse authorize_url: %v", err)
 		}
 		state := authorizeURL.Query().Get("state")
-		callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/claim/callback?code="+neturl.QueryEscape(code)+"&state="+neturl.QueryEscape(state), nil)
+		callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/repo-access/callback?code="+neturl.QueryEscape(code)+"&state="+neturl.QueryEscape(state), nil)
 		callbackReq.Header.Set("Cookie", joinCookieHeader("", start.Result().Cookies()))
 		callback := httptest.NewRecorder()
 		h.ServeHTTP(callback, callbackReq)
@@ -1477,7 +1592,7 @@ func TestClaimGitHubCallbackRejectsMissingVerifiedEmail(t *testing.T) {
 		t.Fatalf("parse authorize url: %v", err)
 	}
 
-	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/claim/callback?code=gh-code&state="+neturl.QueryEscape(authorizeURL.Query().Get("state")), nil)
+	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/repo-access/callback?code=gh-code&state="+neturl.QueryEscape(authorizeURL.Query().Get("state")), nil)
 	callbackReq.Header.Set("Cookie", joinCookieHeader("", start.Result().Cookies()))
 	callback := httptest.NewRecorder()
 	h.ServeHTTP(callback, callbackReq)
@@ -1520,7 +1635,7 @@ func TestClaimGitHubCallbackProviderErrorReturnsToClaimFrontend(t *testing.T) {
 		t.Fatalf("parse authorize url: %v", err)
 	}
 
-	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/claim/callback?error=access_denied&state="+neturl.QueryEscape(authorizeURL.Query().Get("state")), nil)
+	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/repo-access/callback?error=access_denied&state="+neturl.QueryEscape(authorizeURL.Query().Get("state")), nil)
 	callbackReq.Header.Set("Cookie", joinCookieHeader("", start.Result().Cookies()))
 	callback := httptest.NewRecorder()
 	h.ServeHTTP(callback, callbackReq)

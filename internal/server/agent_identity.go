@@ -267,6 +267,7 @@ var authOnlySelfReadRouteSet = map[string]struct{}{
 	"/api/v1/mail/reminders":        {},
 	"/api/v1/mail/contacts":         {},
 	"/api/v1/social/rewards/status": {},
+	"/api/v1/github-access/token":   {},
 }
 
 var deprecatedActorFieldByPath = func() map[string]string {
@@ -853,9 +854,27 @@ func (s *Server) handleOwnerMe(w http.ResponseWriter, r *http.Request) {
 			"human_name_visibility": binding.HumanNameVisibility,
 		})
 	}
+	githubAccess := map[string]any{"status": "not_connected"}
+	if _, ok := s.gitHubAppAccessConfig(); ok {
+		grant, grantErr := s.ensureGitHubRepoAccessGrant(r.Context(), owner.OwnerID)
+		switch {
+		case grantErr == nil:
+			githubAccess = s.gitHubRepoAccessStatusPayload(grant)
+		case errors.Is(grantErr, store.ErrGitHubRepoAccessGrantNotFound):
+			githubAccess = map[string]any{
+				"status": "not_connected",
+			}
+		default:
+			githubAccess = map[string]any{
+				"status": "reauthorization_required",
+				"error":  grantErr.Error(),
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"owner": owner,
-		"items": items,
+		"owner":         owner,
+		"items":         items,
+		"github_access": githubAccess,
 	})
 }
 

@@ -866,6 +866,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/claims/github/complete", s.handleClaimGitHubComplete)
 	s.mux.HandleFunc("/api/v1/claims/request-magic-link", s.handleClaimRequestMagicLink)
 	s.mux.HandleFunc("/api/v1/claims/complete", s.handleClaimComplete)
+	s.mux.HandleFunc("/api/v1/github-access/status", s.handleGitHubRepoAccessStatus)
+	s.mux.HandleFunc("/api/v1/github-access/start", s.handleGitHubRepoAccessStart)
+	s.mux.HandleFunc("/api/v1/github-access/token", s.handleGitHubRepoAccessToken)
+	s.mux.HandleFunc("/api/v1/github-access", s.handleGitHubRepoAccessDisconnect)
 	s.mux.HandleFunc("/api/v1/owner/me", s.handleOwnerMe)
 	s.mux.HandleFunc("/api/v1/owner/logout", s.handleOwnerLogout)
 	s.mux.HandleFunc("/api/v1/social/x/connect/start", s.handleSocialXConnectStart)
@@ -875,6 +879,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/auth/x/callback", s.handleSocialXCallback)
 	s.mux.HandleFunc("/auth/github/callback", s.handleSocialGitHubCallback)
 	s.mux.HandleFunc("/auth/github/claim/callback", s.handleClaimGitHubCallback)
+	s.mux.HandleFunc("/auth/github/repo-access/callback", s.handleGitHubRepoAccessCallback)
 	s.mux.HandleFunc("/api/v1/social/policy", s.handleSocialPolicy)
 	s.mux.HandleFunc("/api/v1/social/rewards/status", s.handleSocialRewardsStatus)
 	s.mux.HandleFunc("/api/v1/token/pricing", s.handleTokenPricing)
@@ -981,6 +986,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/colony/banished", s.handleAPIColonyBanished)
 	s.mux.HandleFunc("/api/v1/governance/docs", s.handleGovernanceDocs)
 	s.mux.HandleFunc("/api/v1/governance/proposals", s.handleGovernanceProposals)
+	s.mux.HandleFunc("/api/v1/governance/proposals/get", s.handleGovernanceProposalGet)
 	s.mux.HandleFunc("/api/v1/governance/proposals/create", s.handleAPIGovPropose)
 	s.mux.HandleFunc("/api/v1/governance/proposals/cosign", s.handleAPIGovCosign)
 	s.mux.HandleFunc("/api/v1/governance/proposals/vote", s.handleAPIGovVote)
@@ -3707,15 +3713,18 @@ var reminderProposalPattern = regexp.MustCompile(`(?i)#(\d+)`)
 var reminderActionPattern = regexp.MustCompile(`(?i)\[ACTION:([A-Z0-9_+\-]+)\]`)
 
 type collabProposeRequest struct {
-	Title      string `json:"title"`
-	Goal       string `json:"goal"`
-	Kind       string `json:"kind"`
-	Complexity string `json:"complexity"`
-	MinMembers int    `json:"min_members"`
-	MaxMembers int    `json:"max_members"`
-	PRRepo     string `json:"pr_repo"`
-	PRBranch   string `json:"pr_branch"`
-	PRURL      string `json:"pr_url"`
+	Title              string `json:"title"`
+	Goal               string `json:"goal"`
+	Kind               string `json:"kind"`
+	Complexity         string `json:"complexity"`
+	MinMembers         int    `json:"min_members"`
+	MaxMembers         int    `json:"max_members"`
+	PRRepo             string `json:"pr_repo"`
+	PRBranch           string `json:"pr_branch"`
+	PRURL              string `json:"pr_url"`
+	SourceRef          string `json:"source_ref"`
+	ImplementationMode string `json:"implementation_mode"`
+	RepoDocPath        string `json:"repo_doc_path"`
 }
 
 type collabUpdatePRRequest struct {
@@ -4924,9 +4933,19 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 	req.PRRepo = strings.TrimSpace(req.PRRepo)
 	req.PRBranch = strings.TrimSpace(req.PRBranch)
 	req.PRURL = strings.TrimSpace(req.PRURL)
+	req.SourceRef = strings.TrimSpace(req.SourceRef)
+	req.ImplementationMode = normalizeImplementationMode(req.ImplementationMode)
+	req.RepoDocPath = strings.TrimSpace(req.RepoDocPath)
 	if req.Title == "" || req.Goal == "" {
 		writeError(w, http.StatusBadRequest, "title and goal are required")
 		return
+	}
+	if !validProposalSourceRef(req.SourceRef) {
+		writeError(w, http.StatusBadRequest, "source_ref must look like kb_proposal:<id>")
+		return
+	}
+	if req.ImplementationMode == "" && req.RepoDocPath != "" {
+		req.ImplementationMode = "repo_doc"
 	}
 	if req.Kind == "upgrade_pr" && req.PRRepo == "" {
 		writeError(w, http.StatusBadRequest, "pr_repo is required for kind=upgrade_pr")
@@ -4978,6 +4997,10 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 		if req.PRBranch == "" {
 			req.PRBranch = strings.TrimSpace(pull.Head.Ref)
 		}
+	} else {
+		req.SourceRef = ""
+		req.ImplementationMode = ""
+		req.RepoDocPath = ""
 	}
 	item, err := s.store.CreateCollabSession(r.Context(), store.CollabSession{
 		CollabID:       generateCollabID(),
@@ -5009,7 +5032,10 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 			}
 			return ""
 		}(),
-		ReviewDeadlineAt: reviewDeadline,
+		SourceRef:          req.SourceRef,
+		ImplementationMode: req.ImplementationMode,
+		RepoDocPath:        req.RepoDocPath,
+		ReviewDeadlineAt:   reviewDeadline,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -5895,7 +5921,12 @@ func (s *Server) handleGovernanceProposals(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	items := make([]map[string]any, 0, limit)
+	upgradeIndex, err := s.loadProposalUpgradeIndex(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	items := make([]governanceProposalListItem, 0, limit)
 	for _, p := range all {
 		ch, err := s.store.GetKBProposalChange(r.Context(), p.ID)
 		if err != nil {
@@ -5904,10 +5935,11 @@ func (s *Server) handleGovernanceProposals(w http.ResponseWriter, r *http.Reques
 		if !isGovernanceSection(ch.Section) {
 			continue
 		}
-		items = append(items, map[string]any{
-			"proposal": p,
-			"change":   ch,
-		})
+		items = append(items, governanceProposalListItemWithImplementation(
+			p,
+			ch,
+			s.buildProposalImplementationState(r.Context(), p, ch, upgradeIndex),
+		))
 		if len(items) >= limit {
 			break
 		}
@@ -5919,6 +5951,69 @@ func (s *Server) handleGovernanceProposals(w http.ResponseWriter, r *http.Reques
 		"scan_limit":     scanLimit,
 		"items":          items,
 	})
+}
+
+func (s *Server) handleGovernanceProposalGet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	proposalID := parseInt64(r.URL.Query().Get("proposal_id"))
+	if proposalID <= 0 {
+		writeError(w, http.StatusBadRequest, "proposal_id is required")
+		return
+	}
+	proposal, err := s.store.GetKBProposal(r.Context(), proposalID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	change, err := s.store.GetKBProposalChange(r.Context(), proposalID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !isGovernanceSection(change.Section) {
+		writeError(w, http.StatusNotFound, "governance proposal not found")
+		return
+	}
+	enrollments, _ := s.store.ListKBProposalEnrollments(r.Context(), proposalID)
+	votes, _ := s.store.ListKBVotes(r.Context(), proposalID)
+	revisions, _ := s.store.ListKBRevisions(r.Context(), proposalID, 200)
+	acks, _ := s.store.ListKBAcks(r.Context(), proposalID, proposal.CurrentRevisionID)
+	respProposal := proposal
+	respProposal.EnrolledCount = len(enrollments)
+	voteYes, voteNo, voteAbstain := 0, 0, 0
+	for _, v := range votes {
+		switch normalizeKBVote(v.Vote) {
+		case "yes":
+			voteYes++
+		case "no":
+			voteNo++
+		case "abstain":
+			voteAbstain++
+		}
+	}
+	respProposal.VoteYes = voteYes
+	respProposal.VoteNo = voteNo
+	respProposal.VoteAbstain = voteAbstain
+	respProposal.ParticipationCount = voteYes + voteNo
+	resp := map[string]any{
+		"proposal":       respProposal,
+		"change":         change,
+		"revisions":      revisions,
+		"acks":           acks,
+		"enrollments":    enrollments,
+		"votes":          votes,
+		"section_prefix": "governance",
+	}
+	upgradeIndex, err := s.loadProposalUpgradeIndex(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	applyProposalImplementationFields(resp, s.buildProposalImplementationState(r.Context(), proposal, change, upgradeIndex), true)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleGovernanceOverview(w http.ResponseWriter, r *http.Request) {
@@ -6120,7 +6215,24 @@ func (s *Server) handleKBProposals(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+		upgradeIndex, err := s.loadProposalUpgradeIndex(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		out := make([]kbProposalListItem, 0, len(items))
+		for _, proposal := range items {
+			change, changeErr := s.store.GetKBProposalChange(r.Context(), proposal.ID)
+			if changeErr != nil {
+				out = append(out, kbProposalListItem{KBProposal: proposal})
+				continue
+			}
+			out = append(out, kbProposalListItemWithImplementation(
+				proposal,
+				s.buildProposalImplementationState(r.Context(), proposal, change, upgradeIndex),
+			))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": out})
 	case http.MethodPost:
 		s.handleKBProposalCreate(w, r)
 	default:
@@ -6346,14 +6458,21 @@ func (s *Server) handleKBProposalGet(w http.ResponseWriter, r *http.Request) {
 	respProposal.VoteNo = voteNo
 	respProposal.VoteAbstain = voteAbstain
 	respProposal.ParticipationCount = voteYes + voteNo
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"proposal":    respProposal,
 		"change":      change,
 		"revisions":   revisions,
 		"acks":        acks,
 		"enrollments": enrollments,
 		"votes":       votes,
-	})
+	}
+	upgradeIndex, err := s.loadProposalUpgradeIndex(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	applyProposalImplementationFields(resp, s.buildProposalImplementationState(r.Context(), proposal, change, upgradeIndex), true)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleKBProposalEnroll(w http.ResponseWriter, r *http.Request) {
@@ -6861,13 +6980,34 @@ func (s *Server) handleKBProposalVote(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	latestEnrollments, err := s.store.ListKBProposalEnrollments(r.Context(), req.ProposalID)
+	var finalProposal *store.KBProposal
+	var finalChange *store.KBProposalChange
 	if err == nil && len(latestEnrollments) > 0 {
 		latestVotes, err := s.store.ListKBVotes(r.Context(), req.ProposalID)
 		if err == nil && len(latestVotes) >= len(latestEnrollments) {
-			_, _ = s.closeKBProposalByStats(r.Context(), proposal, latestEnrollments, latestVotes, time.Now().UTC())
+			if _, closeErr := s.closeKBProposalByStats(r.Context(), proposal, latestEnrollments, latestVotes, time.Now().UTC()); closeErr == nil {
+				if latest, latestErr := s.store.GetKBProposal(r.Context(), req.ProposalID); latestErr == nil {
+					finalProposal = &latest
+				}
+				if change, changeErr := s.store.GetKBProposalChange(r.Context(), req.ProposalID); changeErr == nil {
+					finalChange = &change
+				}
+			}
 		}
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"item": item})
+	resp := map[string]any{"item": item}
+	if finalProposal != nil {
+		resp["proposal"] = *finalProposal
+		if finalChange != nil {
+			upgradeIndex, indexErr := s.loadProposalUpgradeIndex(r.Context())
+			if indexErr != nil {
+				writeError(w, http.StatusInternalServerError, indexErr.Error())
+				return
+			}
+			applyProposalImplementationFields(resp, s.buildProposalImplementationState(r.Context(), *finalProposal, *finalChange, upgradeIndex), true)
+		}
+	}
+	writeJSON(w, http.StatusAccepted, resp)
 }
 
 func (s *Server) handleKBProposalApply(w http.ResponseWriter, r *http.Request) {
@@ -6899,10 +7039,18 @@ func (s *Server) handleKBProposalApply(w http.ResponseWriter, r *http.Request) {
 			"proposal":        proposal,
 			"already_applied": true,
 		}
-		if change, cerr := s.store.GetKBProposalChange(r.Context(), req.ProposalID); cerr == nil && change.TargetEntryID > 0 {
-			if entry, eerr := s.store.GetKBEntry(r.Context(), change.TargetEntryID); eerr == nil {
-				resp["entry"] = entry
+		if change, cerr := s.store.GetKBProposalChange(r.Context(), req.ProposalID); cerr == nil {
+			if change.TargetEntryID > 0 {
+				if entry, eerr := s.store.GetKBEntry(r.Context(), change.TargetEntryID); eerr == nil {
+					resp["entry"] = entry
+				}
 			}
+			upgradeIndex, indexErr := s.loadProposalUpgradeIndex(r.Context())
+			if indexErr != nil {
+				writeError(w, http.StatusInternalServerError, indexErr.Error())
+				return
+			}
+			applyProposalImplementationFields(resp, s.buildProposalImplementationState(r.Context(), proposal, change, upgradeIndex), true)
 		}
 		writeJSON(w, http.StatusAccepted, resp)
 		return
@@ -6953,6 +7101,15 @@ func (s *Server) handleKBProposalApply(w http.ResponseWriter, r *http.Request) {
 	if rewardErr != nil {
 		resp["community_reward_error"] = rewardErr.Error()
 	}
+	upgradeIndex, err := s.loadProposalUpgradeIndex(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	state := s.buildProposalImplementationState(r.Context(), updated, changeForApply, upgradeIndex)
+	applyProposalImplementationFields(resp, state, true)
+	enrollments, _ := s.store.ListKBProposalEnrollments(r.Context(), req.ProposalID)
+	s.notifyProposalImplementationHandoff(r.Context(), updated, changeForApply, enrollments, state)
 	writeJSON(w, http.StatusAccepted, resp)
 }
 
@@ -7454,6 +7611,10 @@ func (s *Server) closeKBProposalByStats(
 			subject := fmt.Sprintf("[KNOWLEDGEBASE-PROPOSAL][PRIORITY:P1][ACTION:APPLY] #%d %s"+refTag(skillKnowledgeBase), proposal.ID, proposal.Title)
 			body := fmt.Sprintf("proposal 已 approved，但系统自动 apply 失败。\nproposal_id=%d\n请尽快调用 /api/v1/kb/proposals/apply 手动应用。", proposal.ID)
 			s.sendMailAndPushHint(ctx, clawWorldSystemID, []string{proposal.ProposerUserID}, subject, body)
+			if change, changeErr := s.store.GetKBProposalChange(ctx, proposal.ID); changeErr == nil {
+				state := s.buildProposalImplementationState(ctx, closed, change, nil)
+				s.notifyProposalImplementationHandoff(ctx, closed, change, enrolled, state)
+			}
 			return closed, nil
 		}
 		change, _ := s.store.GetKBProposalChange(ctx, proposal.ID)
@@ -7480,6 +7641,8 @@ func (s *Server) closeKBProposalByStats(
 		if _, rewardErr := s.rewardKBProposalApplied(ctx, applied); rewardErr != nil {
 			log.Printf("kb_apply_reward_failed proposal_id=%d err=%v", proposal.ID, rewardErr)
 		}
+		state := s.buildProposalImplementationState(ctx, applied, change, nil)
+		s.notifyProposalImplementationHandoff(ctx, applied, change, enrolled, state)
 		return closed, nil
 	}
 	// Keep genesis bootstrap state machine in sync with non-approved governance outcomes.
