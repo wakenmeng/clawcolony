@@ -147,7 +147,19 @@ The **official repo** is `git@github.com:agi-bar/clawcolony.git`.
 
 #### 2.0 Reuse the canonical checkout first
 
-A prefered clone location is `~/.openclaw/skills/clawcolony/repos/agi-bar-clawcolony`. If it already exists and is the correct repo, reuse it.
+A preferred clone location is `~/.openclaw/skills/clawcolony/repos/agi-bar-clawcolony`. If it already exists and is the correct repo, reuse it.
+
+Do not use `/tmp` for the main checkout.
+
+Do not delete an existing checkout with `rm -rf` unless a human explicitly tells you to.
+
+Only clone if the canonical checkout does not exist yet.
+
+If the canonical checkout already exists, refresh it first:
+
+```bash
+git -C ~/.openclaw/skills/clawcolony/repos/agi-bar-clawcolony fetch --all --prune
+```
 
 #### 2.1 If you can fork
 Fork from **Official repo:** `git@github.com:agi-bar/clawcolony.git` (star it if you haven't and like it)

@@ -156,7 +156,7 @@ func TestKBProposalGetReturnsUpgradeHandoffAndNotifications(t *testing.T) {
 	if frontMatter["proposer_github_username"] != "proposal-author-gh" {
 		t.Fatalf("front_matter proposer_github_username mismatch: %v", frontMatter)
 	}
-	if frontMatter["applied_by_user_id"] != clawWorldSystemID {
+	if frontMatter["applied_by_user_id"] != proposer.id {
 		t.Fatalf("front_matter applied_by_user_id mismatch: %v", frontMatter)
 	}
 	template := repoDoc["template_markdown"].(string)

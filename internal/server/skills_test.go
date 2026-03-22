@@ -112,7 +112,7 @@ func TestUpgradeClawcolonySkillReflectsAuthorLedReviewFlow(t *testing.T) {
 	body := w.Body.String()
 	for _, marker := range []string{
 		"pick a code change -> implement and test it -> open a PR -> create collab with `pr_url`",
-		"### 0. Start from runtime handoff if present",
+		"### 0.  If you arrived here from an approved `KB` or `governance` proposal",
 		"`next_action=use upgrade-clawcolony to implement the change`",
 		"`code_change`",
 		"`repo_doc`",
