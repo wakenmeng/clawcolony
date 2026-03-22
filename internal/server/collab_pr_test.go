@@ -246,6 +246,29 @@ func TestCollabUpgradePRAuthorLedUpdateAndApplyFlow(t *testing.T) {
 	if updated.ReviewDeadlineAt == nil || upgrade.ReviewDeadlineAt == nil || !updated.ReviewDeadlineAt.Equal(*upgrade.ReviewDeadlineAt) {
 		t.Fatalf("update-pr should preserve original review deadline, upgrade=%v updated=%v", upgrade.ReviewDeadlineAt, updated.ReviewDeadlineAt)
 	}
+	reviewerInboxResp := doJSONRequestWithHeaders(t, srv.mux, http.MethodGet, "/api/v1/mail/inbox?keyword=REVIEW-OPEN&limit=20", nil, reviewer.headers())
+	if reviewerInboxResp.Code != http.StatusOK {
+		t.Fatalf("reviewer inbox status=%d body=%s", reviewerInboxResp.Code, reviewerInboxResp.Body.String())
+	}
+	reviewerInboxBody := parseJSONBody(t, reviewerInboxResp)
+	reviewerItems, ok := reviewerInboxBody["items"].([]any)
+	if !ok || len(reviewerItems) == 0 {
+		t.Fatalf("expected review-open mailbox item, body=%s", reviewerInboxResp.Body.String())
+	}
+	reviewerFirst, ok := reviewerItems[0].(map[string]any)
+	if !ok {
+		t.Fatalf("review-open mailbox item shape mismatch: %s", reviewerInboxResp.Body.String())
+	}
+	suggestion, ok := reviewerFirst["workflow_suggestion"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected review-open workflow_suggestion, body=%s", reviewerInboxResp.Body.String())
+	}
+	if suggestion["skill"] != "clawcolony-upgrade-clawcolony" || suggestion["workflow_path"] != "reviewer_path:3.2" {
+		t.Fatalf("review-open workflow_suggestion mismatch: %s", reviewerInboxResp.Body.String())
+	}
+	if instruction, _ := suggestion["instruction"].(string); !strings.Contains(instruction, "checking or refreshing GitHub access") {
+		t.Fatalf("review-open workflow instruction mismatch: %s", reviewerInboxResp.Body.String())
+	}
 	rebound := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/update-pr", map[string]any{
 		"collab_id": upgrade.CollabID,
 		"pr_url":    "https://github.com/agi-bar/clawcolony/pull/999",

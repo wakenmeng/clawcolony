@@ -28,8 +28,10 @@ import (
 const (
 	githubRepoAccessStateTTL    = 10 * time.Minute
 	githubRepoAccessResultTTL   = 30 * time.Minute
+	githubRepoAccessReauthTTL   = 15 * time.Minute
 	defaultGitHubAppAPIBaseURL  = "https://api.github.com"
 	githubRepoAccessCallbackURI = "/auth/github/repo-access/callback"
+	githubRepoAccessReauthURI   = "/auth/github/repo-access/reauthorize"
 )
 
 type gitHubAppAccessConfig struct {
@@ -95,6 +97,12 @@ type gitHubRepoAccessCallbackCookiePayload struct {
 	Starred         bool   `json:"starred"`
 	Forked          bool   `json:"forked"`
 	ExpiresAt       int64  `json:"expires_at"`
+}
+
+type gitHubRepoAccessReauthorizePayload struct {
+	OwnerID   string `json:"owner_id"`
+	UserID    string `json:"user_id,omitempty"`
+	ExpiresAt int64  `json:"expires_at"`
 }
 
 type gitHubAppTokenResponse struct {
@@ -1180,6 +1188,48 @@ func (s *Server) gitHubAccessFrontendCallbackURL(values neturl.Values) string {
 	return u.String()
 }
 
+func (s *Server) gitHubRepoAccessReauthorizeURL(r *http.Request, ownerID, userID string) (string, error) {
+	ownerID = strings.TrimSpace(ownerID)
+	if ownerID == "" {
+		return "", fmt.Errorf("owner id is required")
+	}
+	value, err := s.signSocialOAuthPayload(gitHubRepoAccessReauthorizePayload{
+		OwnerID:   ownerID,
+		UserID:    strings.TrimSpace(userID),
+		ExpiresAt: time.Now().UTC().Add(githubRepoAccessReauthTTL).Unix(),
+	})
+	if err != nil {
+		return "", err
+	}
+	target := &neturl.URL{Path: githubRepoAccessReauthURI}
+	query := target.Query()
+	query.Set("token", value)
+	target.RawQuery = query.Encode()
+	if base := strings.TrimSpace(s.cfg.PublicBaseURL); base != "" {
+		u, err := neturl.Parse(base)
+		if err == nil {
+			return u.ResolveReference(target).String(), nil
+		}
+	}
+	return s.absoluteURL(r, target.String()), nil
+}
+
+func (s *Server) augmentGitHubRepoAccessReauthorizePayload(r *http.Request, payload map[string]any, ownerID, userID string) map[string]any {
+	if strings.TrimSpace(ownerID) == "" {
+		return payload
+	}
+	reauthorizeURL, err := s.gitHubRepoAccessReauthorizeURL(r, ownerID, userID)
+	if err != nil || strings.TrimSpace(reauthorizeURL) == "" {
+		return payload
+	}
+	payload["reauthorize_url"] = reauthorizeURL
+	nextAction := strings.TrimSpace(fmt.Sprintf("%v", payload["next_action"]))
+	if nextAction == "" || nextAction == "none" {
+		payload["next_action"] = "open reauthorize_url in a browser, complete GitHub approval, then retry /api/v1/github-access/token"
+	}
+	return payload
+}
+
 func (s *Server) writeGitHubRepoAccessCallbackError(w http.ResponseWriter, r *http.Request, state gitHubRepoAccessStatePayload, msg string) {
 	s.clearGitHubRepoAccessOAuthCookie(w, r)
 	s.clearGitHubRepoAccessCallbackCookie(w, r)
@@ -1255,6 +1305,52 @@ func (s *Server) handleGitHubRepoAccessStart(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+func (s *Server) handleGitHubRepoAccessReauthorize(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	rawToken := strings.TrimSpace(r.URL.Query().Get("token"))
+	if rawToken == "" {
+		writeError(w, http.StatusBadRequest, "reauthorize token is required")
+		return
+	}
+	var payload gitHubRepoAccessReauthorizePayload
+	if err := s.verifySocialOAuthPayload(rawToken, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "reauthorize token is invalid")
+		return
+	}
+	if payload.ExpiresAt < time.Now().UTC().Unix() {
+		writeError(w, http.StatusBadRequest, "reauthorize token expired")
+		return
+	}
+	if strings.TrimSpace(payload.OwnerID) == "" {
+		writeError(w, http.StatusBadRequest, "reauthorize token is invalid")
+		return
+	}
+	if _, err := s.store.GetHumanOwner(r.Context(), payload.OwnerID); err != nil {
+		writeError(w, http.StatusBadRequest, "reauthorize token is invalid")
+		return
+	}
+	if strings.TrimSpace(payload.UserID) != "" {
+		binding, err := s.store.GetAgentHumanBinding(r.Context(), strings.TrimSpace(payload.UserID))
+		if err != nil || strings.TrimSpace(binding.OwnerID) != strings.TrimSpace(payload.OwnerID) {
+			writeError(w, http.StatusBadRequest, "reauthorize token is invalid")
+			return
+		}
+	}
+	authorizeURL, err := s.beginGitHubRepoAccess(w, r, "owner", "", "", payload.OwnerID, s.gitHubAccessFrontendCallbackURL(nil))
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "not configured") {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	http.Redirect(w, r, authorizeURL, http.StatusSeeOther)
+}
+
 func (s *Server) handleGitHubRepoAccessToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1281,7 +1377,7 @@ func (s *Server) handleGitHubRepoAccessToken(w http.ResponseWriter, r *http.Requ
 	grant, err := s.ensureGitHubRepoAccessGrant(r.Context(), binding.OwnerID)
 	if err != nil {
 		if errors.Is(err, store.ErrGitHubRepoAccessGrantNotFound) {
-			writeJSON(w, http.StatusConflict, githubRepoAccessInactivePayload(cfg))
+			writeJSON(w, http.StatusConflict, s.augmentGitHubRepoAccessReauthorizePayload(r, githubRepoAccessInactivePayload(cfg), binding.OwnerID, userID))
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1289,16 +1385,26 @@ func (s *Server) handleGitHubRepoAccessToken(w http.ResponseWriter, r *http.Requ
 	}
 	status := githubRepoAccessStatus(grant)
 	if status != "active_contributor" && status != "active_maintainer" {
-		writeJSON(w, http.StatusConflict, s.gitHubRepoAccessStatusPayload(grant))
+		writeJSON(w, http.StatusConflict, s.augmentGitHubRepoAccessReauthorizePayload(r, s.gitHubRepoAccessStatusPayload(grant), binding.OwnerID, userID))
 		return
 	}
 	accessToken, err := s.decryptGitHubRepoAccessToken(grant.AccessTokenCiphertext)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to decrypt github access token")
+		payload := s.gitHubRepoAccessStatusPayload(grant)
+		payload["status"] = "reauthorization_required"
+		payload["capabilities"] = githubRepoAccessCapabilities(grant.Role, "reauthorization_required")
+		payload["blocking_reason"] = "github_access_token_unavailable"
+		payload["error"] = "failed to decrypt github access token"
+		writeJSON(w, http.StatusConflict, s.augmentGitHubRepoAccessReauthorizePayload(r, payload, binding.OwnerID, userID))
 		return
 	}
 	if strings.TrimSpace(accessToken) == "" {
-		writeError(w, http.StatusServiceUnavailable, "github access token is unavailable")
+		payload := s.gitHubRepoAccessStatusPayload(grant)
+		payload["status"] = "reauthorization_required"
+		payload["capabilities"] = githubRepoAccessCapabilities(grant.Role, "reauthorization_required")
+		payload["blocking_reason"] = "github_access_token_unavailable"
+		payload["error"] = "github access token is unavailable"
+		writeJSON(w, http.StatusConflict, s.augmentGitHubRepoAccessReauthorizePayload(r, payload, binding.OwnerID, userID))
 		return
 	}
 	writeJSON(w, http.StatusOK, s.gitHubRepoAccessTokenPayload(grant, accessToken))

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type gitHubOptionCTestFixture struct {
@@ -462,6 +463,132 @@ func TestAgentGitHubRepoAccessTokenRejectsAgentWithoutConnectedOwnerGrant(t *tes
 	body := parseJSONBody(t, tokenResp)
 	if body["status"] != "not_connected" {
 		t.Fatalf("expected not_connected, got body=%s", tokenResp.Body.String())
+	}
+	reauthorizeURL, err := neturl.Parse(strings.TrimSpace(fmt.Sprintf("%v", body["reauthorize_url"])))
+	if err != nil {
+		t.Fatalf("expected reauthorize_url, got body=%s err=%v", tokenResp.Body.String(), err)
+	}
+	if reauthorizeURL.Path != "/auth/github/repo-access/reauthorize" {
+		t.Fatalf("unexpected reauthorize_url path=%q body=%s", reauthorizeURL.String(), tokenResp.Body.String())
+	}
+	if got := reauthorizeURL.Query().Get("token"); got == "" {
+		t.Fatalf("expected signed reauthorize token, got url=%s", reauthorizeURL.String())
+	}
+	if body["next_action"] != "open reauthorize_url in a browser, complete GitHub approval, then retry /api/v1/github-access/token" {
+		t.Fatalf("unexpected next_action body=%s", tokenResp.Body.String())
+	}
+}
+
+func TestAgentGitHubRepoAccessTokenReturnsReauthorizeURLForRevokedGrant(t *testing.T) {
+	fixture := newGitHubOptionCTestFixture(t, http.StatusOK)
+	fixture.configureEnv(t)
+
+	srv := newTestServer()
+	h := identityTestHandler(srv)
+
+	_, apiKey, claimLink := registerAgentForTest(t, h, "option-c-agent-token-reauth", "oss")
+	_, ownerCookie := claimAgentForTest(t, h, claimLink, "agent-token-reauth-owner@example.com", "agent-token-reauth-owner")
+
+	start := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/github-access/start", nil, map[string]string{
+		"Cookie": ownerCookie,
+	})
+	if start.Code != http.StatusAccepted {
+		t.Fatalf("github access start status=%d body=%s", start.Code, start.Body.String())
+	}
+	startBody := parseJSONBody(t, start)
+	authorizeURL, err := neturl.Parse(startBody["authorize_url"].(string))
+	if err != nil {
+		t.Fatalf("parse authorize url: %v", err)
+	}
+
+	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/repo-access/callback?code=gh-code&state="+neturl.QueryEscape(authorizeURL.Query().Get("state")), nil)
+	callbackReq.Header.Set("Cookie", joinCookieHeader(ownerCookie, start.Result().Cookies()))
+	callback := httptest.NewRecorder()
+	h.ServeHTTP(callback, callbackReq)
+	if callback.Code != http.StatusSeeOther {
+		t.Fatalf("github access callback status=%d body=%s", callback.Code, callback.Body.String())
+	}
+
+	ownerMe := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/owner/me", nil, map[string]string{
+		"Cookie": ownerCookie,
+	})
+	if ownerMe.Code != http.StatusOK {
+		t.Fatalf("owner me status=%d body=%s", ownerMe.Code, ownerMe.Body.String())
+	}
+	ownerBody := parseJSONBody(t, ownerMe)
+	owner, ok := ownerBody["owner"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected owner payload on owner/me: %s", ownerMe.Body.String())
+	}
+	ownerID, _ := owner["owner_id"].(string)
+
+	if _, err := srv.store.RevokeGitHubRepoAccessGrant(context.Background(), ownerID, time.Now().UTC()); err != nil {
+		t.Fatalf("revoke github repo access grant: %v", err)
+	}
+
+	tokenResp := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/github-access/token", nil, apiKeyHeaders(apiKey))
+	if tokenResp.Code != http.StatusConflict {
+		t.Fatalf("github access token status=%d body=%s", tokenResp.Code, tokenResp.Body.String())
+	}
+	body := parseJSONBody(t, tokenResp)
+	if body["status"] != "reauthorization_required" {
+		t.Fatalf("expected reauthorization_required, got body=%s", tokenResp.Body.String())
+	}
+	reauthorizeURL, err := neturl.Parse(strings.TrimSpace(fmt.Sprintf("%v", body["reauthorize_url"])))
+	if err != nil {
+		t.Fatalf("parse reauthorize_url: %v body=%s", err, tokenResp.Body.String())
+	}
+	if reauthorizeURL.Path != "/auth/github/repo-access/reauthorize" {
+		t.Fatalf("unexpected reauthorize_url path=%q", reauthorizeURL.String())
+	}
+
+	reauthReq := httptest.NewRequest(http.MethodGet, reauthorizeURL.RequestURI(), nil)
+	reauthReq.Host = "runtime.test"
+	reauth := httptest.NewRecorder()
+	h.ServeHTTP(reauth, reauthReq)
+	if reauth.Code != http.StatusSeeOther {
+		t.Fatalf("reauthorize status=%d body=%s", reauth.Code, reauth.Body.String())
+	}
+	redirectURL, err := neturl.Parse(reauth.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse reauthorize redirect: %v", err)
+	}
+	if redirectURL.Host == "" || !strings.Contains(redirectURL.Path, "/login/oauth/authorize") {
+		t.Fatalf("unexpected authorize redirect=%s", redirectURL.String())
+	}
+
+	var oauthCookie *http.Cookie
+	for _, cookie := range reauth.Result().Cookies() {
+		if cookie.Name == gitHubRepoAccessOAuthCookieName() {
+			oauthCookie = cookie
+			break
+		}
+	}
+	if oauthCookie == nil {
+		t.Fatalf("expected github repo access oauth cookie on reauthorize")
+	}
+
+	reauthCallbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/repo-access/callback?code=gh-code&state="+neturl.QueryEscape(redirectURL.Query().Get("state")), nil)
+	reauthCallbackReq.Header.Set("Cookie", joinCookieHeader("", []*http.Cookie{oauthCookie}))
+	reauthCallback := httptest.NewRecorder()
+	h.ServeHTTP(reauthCallback, reauthCallbackReq)
+	if reauthCallback.Code != http.StatusSeeOther {
+		t.Fatalf("reauthorize callback status=%d body=%s", reauthCallback.Code, reauthCallback.Body.String())
+	}
+	callbackLocation, err := neturl.Parse(reauthCallback.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse callback location: %v", err)
+	}
+	if callbackLocation.Path != "/github-access/callback" {
+		t.Fatalf("unexpected callback path=%q", callbackLocation.String())
+	}
+	if got := callbackLocation.Query().Get("status"); got != "ok" {
+		t.Fatalf("unexpected callback status=%q", got)
+	}
+
+	successResp := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/github-access/token", nil, apiKeyHeaders(apiKey))
+	if successResp.Code != http.StatusOK {
+		t.Fatalf("github access token after reauthorize status=%d body=%s", successResp.Code, successResp.Body.String())
 	}
 }
 

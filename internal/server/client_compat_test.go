@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,6 +62,9 @@ func TestMailPublicCompatibilityKeepsMessageAndReminderIDs(t *testing.T) {
 	if _, ok := first["reply_to_mailbox_id"]; ok {
 		t.Fatalf("mail inbox should not expose reply_to_mailbox_id: %s", inboxResp.Body.String())
 	}
+	if _, ok := first["workflow_suggestion"]; ok {
+		t.Fatalf("plain mail inbox item should not expose workflow_suggestion without a ref tag: %s", inboxResp.Body.String())
+	}
 
 	overviewResp := doJSONRequestWithHeaders(t, srv.mux, http.MethodGet, "/api/v1/mail/overview?folder=all&limit=20", nil, recipientA.headers())
 	if overviewResp.Code != http.StatusOK {
@@ -71,10 +75,50 @@ func TestMailPublicCompatibilityKeepsMessageAndReminderIDs(t *testing.T) {
 	if !ok || len(overviewItems) == 0 {
 		t.Fatalf("mail overview items missing: %s", overviewResp.Body.String())
 	}
-	if overviewFirst, ok := overviewItems[0].(map[string]any); !ok || overviewFirst["message_id"] == nil {
+	overviewFirst, ok := overviewItems[0].(map[string]any)
+	if !ok || overviewFirst["message_id"] == nil {
 		t.Fatalf("mail overview should expose message_id: %s", overviewResp.Body.String())
 	} else if _, ok := overviewFirst["mailbox_id"]; ok {
 		t.Fatalf("mail overview should not expose mailbox_id: %s", overviewResp.Body.String())
+	}
+	if _, ok := overviewFirst["workflow_suggestion"]; ok {
+		t.Fatalf("plain mail overview item should not expose workflow_suggestion without a ref tag: %s", overviewResp.Body.String())
+	}
+
+	tagged := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/mail/send", map[string]any{
+		"to_user_ids": []string{recipientA.id},
+		"subject":     "[UPGRADE-PR][REVIEW-OPEN] compat route" + refTag(skillUpgrade),
+		"body":        "Follow the upgrade review flow.",
+	}, sender.headers())
+	if tagged.Code != http.StatusAccepted {
+		t.Fatalf("tagged mail send status=%d body=%s", tagged.Code, tagged.Body.String())
+	}
+
+	taggedInboxResp := doJSONRequestWithHeaders(t, srv.mux, http.MethodGet, "/api/v1/mail/inbox?keyword=compat%20route&limit=20", nil, recipientA.headers())
+	if taggedInboxResp.Code != http.StatusOK {
+		t.Fatalf("tagged mail inbox status=%d body=%s", taggedInboxResp.Code, taggedInboxResp.Body.String())
+	}
+	taggedBody := parseJSONBody(t, taggedInboxResp)
+	taggedItems, ok := taggedBody["items"].([]any)
+	if !ok || len(taggedItems) == 0 {
+		t.Fatalf("tagged mail inbox items missing: %s", taggedInboxResp.Body.String())
+	}
+	taggedFirst, ok := taggedItems[0].(map[string]any)
+	if !ok {
+		t.Fatalf("tagged mail inbox item shape mismatch: %s", taggedInboxResp.Body.String())
+	}
+	workflowSuggestion, ok := taggedFirst["workflow_suggestion"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tagged inbox workflow_suggestion, got body=%s", taggedInboxResp.Body.String())
+	}
+	if workflowSuggestion["skill"] != "clawcolony-upgrade-clawcolony" {
+		t.Fatalf("expected tagged inbox workflow_suggestion.skill, got body=%s", taggedInboxResp.Body.String())
+	}
+	if workflowSuggestion["workflow_path"] != "reviewer_path:3.2" {
+		t.Fatalf("expected review-open workflow_path marker, got body=%s", taggedInboxResp.Body.String())
+	}
+	if instruction, _ := workflowSuggestion["instruction"].(string); !strings.Contains(instruction, "checking or refreshing GitHub access") {
+		t.Fatalf("expected review-open workflow instruction, got body=%s", taggedInboxResp.Body.String())
 	}
 
 	inboxA, err := srv.store.ListMailbox(ctx, recipientA.id, "inbox", "", "compat sync", nil, nil, 10)

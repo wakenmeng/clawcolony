@@ -870,6 +870,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/github-access/start", s.handleGitHubRepoAccessStart)
 	s.mux.HandleFunc("/api/v1/github-access/token", s.handleGitHubRepoAccessToken)
 	s.mux.HandleFunc("/api/v1/github-access", s.handleGitHubRepoAccessDisconnect)
+	s.mux.HandleFunc("/auth/github/repo-access/reauthorize", s.handleGitHubRepoAccessReauthorize)
+	s.mux.HandleFunc("/github-access/reauthorize", s.handleGitHubRepoAccessReauthorize)
 	s.mux.HandleFunc("/api/v1/owner/me", s.handleOwnerMe)
 	s.mux.HandleFunc("/api/v1/owner/logout", s.handleOwnerLogout)
 	s.mux.HandleFunc("/api/v1/social/x/connect/start", s.handleSocialXConnectStart)
@@ -3654,16 +3656,23 @@ type publicMailSendResult struct {
 }
 
 type publicMailItem struct {
-	MessageID    int64      `json:"message_id"`
-	OwnerAddress string     `json:"owner_address"`
-	Folder       string     `json:"folder"`
-	FromAddress  string     `json:"from_address"`
-	ToAddress    string     `json:"to_address"`
-	Subject      string     `json:"subject"`
-	Body         string     `json:"body"`
-	IsRead       bool       `json:"is_read"`
-	ReadAt       *time.Time `json:"read_at,omitempty"`
-	SentAt       time.Time  `json:"sent_at"`
+	MessageID          int64                         `json:"message_id"`
+	OwnerAddress       string                        `json:"owner_address"`
+	Folder             string                        `json:"folder"`
+	FromAddress        string                        `json:"from_address"`
+	ToAddress          string                        `json:"to_address"`
+	Subject            string                        `json:"subject"`
+	Body               string                        `json:"body"`
+	WorkflowSuggestion *publicMailWorkflowSuggestion `json:"workflow_suggestion,omitempty"`
+	IsRead             bool                          `json:"is_read"`
+	ReadAt             *time.Time                    `json:"read_at,omitempty"`
+	SentAt             time.Time                     `json:"sent_at"`
+}
+
+type publicMailWorkflowSuggestion struct {
+	Skill        string `json:"skill"`
+	WorkflowPath string `json:"workflow_path,omitempty"`
+	Instruction  string `json:"instruction,omitempty"`
 }
 
 type publicMailReminderItem struct {
@@ -3708,6 +3717,7 @@ func refTag(name string) string {
 	return " [REF:" + name + ".md]"
 }
 
+var mailSkillRefPattern = regexp.MustCompile(`(?i)\[REF:([a-z0-9._-]+)\.md\]`)
 var reminderTickPattern = regexp.MustCompile(`(?i)\btick=(\d+)\b`)
 var reminderProposalPattern = regexp.MustCompile(`(?i)#(\d+)`)
 var reminderActionPattern = regexp.MustCompile(`(?i)\[ACTION:([A-Z0-9_+\-]+)\]`)
@@ -3877,17 +3887,71 @@ func publicMailSendResultFromStore(item store.MailSendResult) publicMailSendResu
 
 func publicMailItemFromStore(item store.MailItem) publicMailItem {
 	return publicMailItem{
-		MessageID:    item.MessageID,
-		OwnerAddress: strings.TrimSpace(item.OwnerAddress),
-		Folder:       strings.TrimSpace(item.Folder),
-		FromAddress:  strings.TrimSpace(item.FromAddress),
-		ToAddress:    strings.TrimSpace(item.ToAddress),
-		Subject:      strings.TrimSpace(item.Subject),
-		Body:         strings.TrimSpace(item.Body),
-		IsRead:       item.IsRead,
-		ReadAt:       item.ReadAt,
-		SentAt:       item.SentAt,
+		MessageID:          item.MessageID,
+		OwnerAddress:       strings.TrimSpace(item.OwnerAddress),
+		Folder:             strings.TrimSpace(item.Folder),
+		FromAddress:        strings.TrimSpace(item.FromAddress),
+		ToAddress:          strings.TrimSpace(item.ToAddress),
+		Subject:            strings.TrimSpace(item.Subject),
+		Body:               strings.TrimSpace(item.Body),
+		WorkflowSuggestion: workflowSuggestionForMailItem(item),
+		IsRead:             item.IsRead,
+		ReadAt:             item.ReadAt,
+		SentAt:             item.SentAt,
 	}
+}
+
+func workflowSuggestionForMailItem(item store.MailItem) *publicMailWorkflowSuggestion {
+	skill := agentSkillNameForMailItem(item)
+	if skill == "" {
+		return nil
+	}
+	suggestion := &publicMailWorkflowSuggestion{
+		Skill:       skill,
+		Instruction: "Open the hinted skill and use it as the workflow for this mail.",
+	}
+	subject := strings.ToUpper(strings.TrimSpace(item.Subject))
+	switch {
+	case skill == "clawcolony-upgrade-clawcolony" && strings.Contains(subject, "[UPGRADE-PR][REVIEW-OPEN]"):
+		suggestion.WorkflowPath = "reviewer_path:3.2"
+		suggestion.Instruction = "Start at upgrade-clawcolony.md reviewer_path:3.2 and follow it from the top, including checking or refreshing GitHub access with /api/v1/github-access/token before review if needed."
+	}
+	return suggestion
+}
+
+func agentSkillNameForMailItem(item store.MailItem) string {
+	refName := mailSkillRefName(item.Subject)
+	if refName == "" {
+		refName = mailSkillRefName(item.Body)
+	}
+	switch refName {
+	case "skill":
+		return "clawcolony"
+	case skillHeartbeat:
+		return "clawcolony-heartbeat"
+	case skillKnowledgeBase:
+		return "clawcolony-knowledge-base"
+	case skillCollabMode:
+		return "clawcolony-collab-mode"
+	case skillGovernance:
+		return "clawcolony-governance"
+	case skillGangliaStack:
+		return "clawcolony-ganglia-stack"
+	case skillColonyTools:
+		return "clawcolony-colony-tools"
+	case skillUpgrade:
+		return "clawcolony-upgrade-clawcolony"
+	default:
+		return ""
+	}
+}
+
+func mailSkillRefName(text string) string {
+	matches := mailSkillRefPattern.FindStringSubmatch(strings.TrimSpace(text))
+	if len(matches) != 2 {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(matches[1]))
 }
 
 func publicMailItems(items []store.MailItem) []publicMailItem {
