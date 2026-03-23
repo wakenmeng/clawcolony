@@ -268,6 +268,7 @@ var authOnlySelfReadRouteSet = map[string]struct{}{
 	"/api/v1/mail/reminders":        {},
 	"/api/v1/mail/contacts":         {},
 	"/api/v1/social/rewards/status": {},
+	"/api/v1/github-access/token":   {},
 }
 
 var deprecatedActorFieldByPath = func() map[string]string {
@@ -854,9 +855,27 @@ func (s *Server) handleOwnerMe(w http.ResponseWriter, r *http.Request) {
 			"human_name_visibility": binding.HumanNameVisibility,
 		})
 	}
+	githubAccess := map[string]any{"status": "not_connected"}
+	if _, ok := s.gitHubAppAccessConfig(); ok {
+		grant, grantErr := s.ensureGitHubRepoAccessGrant(r.Context(), owner.OwnerID)
+		switch {
+		case grantErr == nil:
+			githubAccess = s.gitHubRepoAccessStatusPayload(grant)
+		case errors.Is(grantErr, store.ErrGitHubRepoAccessGrantNotFound):
+			githubAccess = map[string]any{
+				"status": "not_connected",
+			}
+		default:
+			githubAccess = map[string]any{
+				"status": "reauthorization_required",
+				"error":  grantErr.Error(),
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"owner": owner,
-		"items": items,
+		"owner":         owner,
+		"items":         items,
+		"github_access": githubAccess,
 	})
 }
 
@@ -918,7 +937,7 @@ func (s *Server) recordSocialConnectStart(userID, provider string) {
 
 func (s *Server) socialPolicyPayload() map[string]any {
 	xCfg, xEnabled := s.socialOAuthConfig("x")
-	gitHubCfg, gitHubEnabled := s.socialOAuthConfig("github")
+	gitHubAppCfg, gitHubAppEnabled := s.gitHubAppAccessConfig()
 	return map[string]any{
 		"mode":                   "oauth_callback",
 		"economic":               !s.tokenEconomyV2Enabled(),
@@ -938,17 +957,20 @@ func (s *Server) socialPolicyPayload() map[string]any {
 				"scopes":                xCfg.Scopes,
 			},
 			"github": map[string]any{
-				"oauth_enabled":      gitHubEnabled,
+				"oauth_enabled":      gitHubAppEnabled,
+				"app_backed":         gitHubAppEnabled,
+				"authorization_mode": "github_app",
 				"connect_path":       "/api/v1/social/github/connect/start",
-				"callback_path":      "/auth/github/callback",
-				"authorize_url":      gitHubCfg.AuthorizeURL,
+				"callback_path":      githubRepoAccessCallbackURI,
+				"authorize_url":      gitHubAppCfg.AuthorizeURL,
+				"display_name":       strings.TrimSpace(gitHubAppCfg.DisplayName),
 				"official_repo":      s.officialGitHubRepo(),
 				"reward_auth_amount": s.socialRewardAmountGitHubAuth(),
 				"reward_star_amount": s.socialRewardAmountGitHubStar(),
 				"reward_fork_amount": s.socialRewardAmountGitHubFork(),
 				"economic":           !s.tokenEconomyV2Enabled(),
-				"verification_mode":  "oauth_callback_and_provider_api",
-				"scopes":             gitHubCfg.Scopes,
+				"verification_mode":  "github_app_callback_and_provider_api",
+				"scopes":             []string{},
 			},
 		},
 	}
@@ -1093,9 +1115,8 @@ func (s *Server) handleSocialGitHubConnectStart(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-	cfg, ok := s.socialOAuthConfig("github")
-	if !ok {
-		writeError(w, http.StatusServiceUnavailable, "github oauth is not configured")
+	if _, ok := s.gitHubAppAccessConfig(); !ok {
+		writeError(w, http.StatusServiceUnavailable, "github repo access is not configured")
 		return
 	}
 	if retryAfter := s.socialConnectRetryAfter(req.UserID, "github"); retryAfter > 0 {
@@ -1112,7 +1133,7 @@ func (s *Server) handleSocialGitHubConnectStart(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	authorizeURL, err := s.beginSocialOAuth(w, r, cfg, session, strings.TrimSpace(req.UserID), strings.TrimSpace(req.Handle))
+	authorizeURL, err := s.beginGitHubRepoAccess(w, r, "social", "", strings.TrimSpace(req.UserID), session.OwnerID, s.socialCallbackRedirectURL("github", nil))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1121,7 +1142,7 @@ func (s *Server) handleSocialGitHubConnectStart(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"item":          sanitizeSocialLink(link),
 		"authorize_url": authorizeURL,
-		"guide":         fmt.Sprintf("Open authorize_url in the browser. The callback will verify whether the authenticated GitHub account starred or forked %s and grant rewards idempotently.", s.officialGitHubRepo()),
+		"guide":         fmt.Sprintf("Open authorize_url in the browser. The GitHub App callback will connect the GitHub identity, verify whether it starred or forked %s, and grant rewards idempotently.", s.officialGitHubRepo()),
 		"repo":          s.officialGitHubRepo(),
 		"policy":        s.socialPolicyPayload()["providers"].(map[string]any)["github"],
 	})
@@ -1132,7 +1153,7 @@ func (s *Server) handleSocialGitHubVerify(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	writeError(w, http.StatusConflict, "manual github verification is disabled; complete the oauth callback flow instead")
+	writeError(w, http.StatusConflict, "manual github verification is disabled; complete the github app callback flow instead")
 }
 
 func (s *Server) grantSocialRewardForGitHub(ctx context.Context, userID, rewardType string, amount int64) map[string]any {
@@ -1342,6 +1363,14 @@ func requestIsHTTPS(r *http.Request) bool {
 }
 
 func (s *Server) absoluteURL(r *http.Request, targetPath string) string {
+	base := strings.TrimSpace(s.cfg.PublicBaseURL)
+	if base != "" {
+		u, err := neturl.Parse(base)
+		if err == nil {
+			ref, _ := neturl.Parse(targetPath)
+			return strings.TrimRight(u.ResolveReference(ref).String(), "/")
+		}
+	}
 	scheme := "http"
 	if requestIsHTTPS(r) {
 		scheme = "https"
@@ -1952,34 +1981,7 @@ func (s *Server) completeGitHubOAuthCallback(ctx context.Context, ownerID, userI
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now().UTC()
-	status := "authorized"
-	if starred || forked {
-		status = "verified"
-	}
-	link, err := s.store.UpsertSocialLink(ctx, store.SocialLink{
-		UserID:   strings.TrimSpace(userID),
-		Provider: "github",
-		Handle:   strings.TrimSpace(viewer.Login),
-		Status:   status,
-		MetadataJSON: mustMarshalJSON(map[string]any{
-			"provider_user_id": viewer.ID,
-			"repo":             s.officialGitHubRepo(),
-			"starred":          starred,
-			"forked":           forked,
-			"owner_id":         ownerID,
-		}),
-		VerifiedAt: func() *time.Time {
-			if status != "verified" {
-				return nil
-			}
-			return &now
-		}(),
-	})
-	if err != nil {
-		return nil, err
-	}
-	grants, _, err := s.grantGitHubOnboardingRewards(ctx, owner, userID, starred, forked, "social.github.oauth")
+	link, grants, err := s.completeGitHubSocialLinkAndRewards(ctx, owner, userID, strings.TrimSpace(viewer.Login), fmt.Sprintf("%d", viewer.ID), starred, forked, "social.github.oauth")
 	if err != nil {
 		return nil, err
 	}
@@ -1992,6 +1994,55 @@ func (s *Server) completeGitHubOAuthCallback(ctx context.Context, ownerID, userI
 		"username": viewer.Login,
 		"owner":    owner,
 	}, nil
+}
+
+func (s *Server) completeGitHubSocialLinkAndRewards(ctx context.Context, owner store.HumanOwner, userID, githubUsername, githubUserID string, starred, forked bool, source string) (store.SocialLink, []map[string]any, error) {
+	binding, err := s.store.GetAgentHumanBinding(ctx, userID)
+	if err != nil {
+		return store.SocialLink{}, nil, err
+	}
+	if strings.TrimSpace(binding.OwnerID) != strings.TrimSpace(owner.OwnerID) {
+		return store.SocialLink{}, nil, errOwnerForbidden
+	}
+	now := time.Now().UTC()
+	status := "authorized"
+	if starred || forked {
+		status = "verified"
+	}
+	link, err := s.store.UpsertSocialLink(ctx, store.SocialLink{
+		UserID:   strings.TrimSpace(userID),
+		Provider: "github",
+		Handle:   strings.TrimSpace(githubUsername),
+		Status:   status,
+		MetadataJSON: mustMarshalJSON(map[string]any{
+			"provider_user_id": strings.TrimSpace(githubUserID),
+			"repo":             s.officialGitHubRepo(),
+			"starred":          starred,
+			"forked":           forked,
+			"owner_id":         strings.TrimSpace(owner.OwnerID),
+			"source":           strings.TrimSpace(source),
+		}),
+		VerifiedAt: func() *time.Time {
+			if status != "verified" {
+				return nil
+			}
+			return &now
+		}(),
+	})
+	if err != nil {
+		return store.SocialLink{}, nil, err
+	}
+	if _, err := s.store.UpsertAgentProfile(ctx, store.AgentProfile{
+		UserID:         strings.TrimSpace(userID),
+		GitHubUsername: strings.TrimSpace(githubUsername),
+	}); err != nil {
+		return store.SocialLink{}, nil, err
+	}
+	grants, _, err := s.grantGitHubOnboardingRewards(ctx, owner, userID, starred, forked, source)
+	if err != nil {
+		return store.SocialLink{}, nil, err
+	}
+	return link, grants, nil
 }
 
 func (s *Server) officialGitHubRepo() string {

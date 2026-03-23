@@ -180,6 +180,9 @@ type CollabSession struct {
 	PRAuthorLogin       string     `json:"pr_author_login,omitempty"`
 	GitHubPRState       string     `json:"github_pr_state,omitempty"`
 	PRMergeCommitSHA    string     `json:"pr_merge_commit_sha,omitempty"`
+	SourceRef           string     `json:"source_ref,omitempty"`
+	ImplementationMode  string     `json:"implementation_mode,omitempty"`
+	RepoDocPath         string     `json:"repo_doc_path,omitempty"`
 	CreatedAt           time.Time  `json:"created_at"`
 	UpdatedAt           time.Time  `json:"updated_at"`
 	ReviewDeadlineAt    *time.Time `json:"review_deadline_at,omitempty"`
@@ -621,11 +624,15 @@ type Store interface {
 	FindAgentProfileByUsername(ctx context.Context, username string) (AgentProfile, error)
 	UpsertHumanOwner(ctx context.Context, email, humanUsername string) (HumanOwner, error)
 	GetHumanOwner(ctx context.Context, ownerID string) (HumanOwner, error)
+	GetHumanOwnerByEmail(ctx context.Context, email string) (HumanOwner, error)
 	UpsertHumanOwnerSocialIdentity(ctx context.Context, ownerID, provider, handle, providerUserID string) (HumanOwner, error)
 	CreateHumanOwnerSession(ctx context.Context, ownerID, tokenHash string, expiresAt time.Time) (HumanOwnerSession, error)
 	GetHumanOwnerSessionByTokenHash(ctx context.Context, tokenHash string) (HumanOwnerSession, error)
 	TouchHumanOwnerSession(ctx context.Context, sessionID string, seenAt time.Time) (HumanOwnerSession, error)
 	RevokeHumanOwnerSession(ctx context.Context, sessionID string, revokedAt time.Time) error
+	UpsertGitHubRepoAccessGrant(ctx context.Context, item GitHubRepoAccessGrant) (GitHubRepoAccessGrant, error)
+	GetGitHubRepoAccessGrant(ctx context.Context, ownerID string) (GitHubRepoAccessGrant, error)
+	RevokeGitHubRepoAccessGrant(ctx context.Context, ownerID string, revokedAt time.Time) (GitHubRepoAccessGrant, error)
 	UpsertAgentHumanBinding(ctx context.Context, item AgentHumanBinding) (AgentHumanBinding, error)
 	GetAgentHumanBinding(ctx context.Context, userID string) (AgentHumanBinding, error)
 	ListAgentHumanBindingsByOwner(ctx context.Context, ownerID string) ([]AgentHumanBinding, error)

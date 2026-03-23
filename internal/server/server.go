@@ -868,6 +868,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/claims/github/complete", s.handleClaimGitHubComplete)
 	s.mux.HandleFunc("/api/v1/claims/request-magic-link", s.handleClaimRequestMagicLink)
 	s.mux.HandleFunc("/api/v1/claims/complete", s.handleClaimComplete)
+	s.mux.HandleFunc("/api/v1/github-access/status", s.handleGitHubRepoAccessStatus)
+	s.mux.HandleFunc("/api/v1/github-access/start", s.handleGitHubRepoAccessStart)
+	s.mux.HandleFunc("/api/v1/github-access/token", s.handleGitHubRepoAccessToken)
+	s.mux.HandleFunc("/api/v1/github-access", s.handleGitHubRepoAccessDisconnect)
+	s.mux.HandleFunc("/auth/github/repo-access/reauthorize", s.handleGitHubRepoAccessReauthorize)
+	s.mux.HandleFunc("/github-access/reauthorize", s.handleGitHubRepoAccessReauthorize)
 	s.mux.HandleFunc("/api/v1/owner/me", s.handleOwnerMe)
 	s.mux.HandleFunc("/api/v1/owner/logout", s.handleOwnerLogout)
 	s.mux.HandleFunc("/api/v1/social/x/connect/start", s.handleSocialXConnectStart)
@@ -877,6 +883,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/auth/x/callback", s.handleSocialXCallback)
 	s.mux.HandleFunc("/auth/github/callback", s.handleSocialGitHubCallback)
 	s.mux.HandleFunc("/auth/github/claim/callback", s.handleClaimGitHubCallback)
+	s.mux.HandleFunc("/auth/github/repo-access/callback", s.handleGitHubRepoAccessCallback)
 	s.mux.HandleFunc("/api/v1/social/policy", s.handleSocialPolicy)
 	s.mux.HandleFunc("/api/v1/social/rewards/status", s.handleSocialRewardsStatus)
 	s.mux.HandleFunc("/api/v1/token/pricing", s.handleTokenPricing)
@@ -985,6 +992,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/colony/banished", s.handleAPIColonyBanished)
 	s.mux.HandleFunc("/api/v1/governance/docs", s.handleGovernanceDocs)
 	s.mux.HandleFunc("/api/v1/governance/proposals", s.handleGovernanceProposals)
+	s.mux.HandleFunc("/api/v1/governance/proposals/get", s.handleGovernanceProposalGet)
 	s.mux.HandleFunc("/api/v1/governance/proposals/create", s.handleAPIGovPropose)
 	s.mux.HandleFunc("/api/v1/governance/proposals/cosign", s.handleAPIGovCosign)
 	s.mux.HandleFunc("/api/v1/governance/proposals/vote", s.handleAPIGovVote)
@@ -3697,16 +3705,23 @@ type publicMailSendResult struct {
 }
 
 type publicMailItem struct {
-	MessageID    int64      `json:"message_id"`
-	OwnerAddress string     `json:"owner_address"`
-	Folder       string     `json:"folder"`
-	FromAddress  string     `json:"from_address"`
-	ToAddress    string     `json:"to_address"`
-	Subject      string     `json:"subject"`
-	Body         string     `json:"body"`
-	IsRead       bool       `json:"is_read"`
-	ReadAt       *time.Time `json:"read_at,omitempty"`
-	SentAt       time.Time  `json:"sent_at"`
+	MessageID          int64                         `json:"message_id"`
+	OwnerAddress       string                        `json:"owner_address"`
+	Folder             string                        `json:"folder"`
+	FromAddress        string                        `json:"from_address"`
+	ToAddress          string                        `json:"to_address"`
+	Subject            string                        `json:"subject"`
+	Body               string                        `json:"body"`
+	WorkflowSuggestion *publicMailWorkflowSuggestion `json:"workflow_suggestion,omitempty"`
+	IsRead             bool                          `json:"is_read"`
+	ReadAt             *time.Time                    `json:"read_at,omitempty"`
+	SentAt             time.Time                     `json:"sent_at"`
+}
+
+type publicMailWorkflowSuggestion struct {
+	Skill        string `json:"skill"`
+	WorkflowPath string `json:"workflow_path,omitempty"`
+	Instruction  string `json:"instruction,omitempty"`
 }
 
 type publicMailReminderItem struct {
@@ -3769,6 +3784,7 @@ func refTag(name string) string {
 	return " [REF:" + name + ".md]"
 }
 
+var mailSkillRefPattern = regexp.MustCompile(`(?i)\[REF:([a-z0-9._-]+)\.md\]`)
 var reminderTickPattern = regexp.MustCompile(`(?i)\btick=(\d+)\b`)
 var reminderProposalPattern = regexp.MustCompile(`(?i)#(\d+)`)
 var reminderActionPattern = regexp.MustCompile(`(?i)\[ACTION:([A-Z0-9_+\-]+)\]`)
@@ -3850,15 +3866,18 @@ func maxDuration(durations ...time.Duration) time.Duration {
 }
 
 type collabProposeRequest struct {
-	Title      string `json:"title"`
-	Goal       string `json:"goal"`
-	Kind       string `json:"kind"`
-	Complexity string `json:"complexity"`
-	MinMembers int    `json:"min_members"`
-	MaxMembers int    `json:"max_members"`
-	PRRepo     string `json:"pr_repo"`
-	PRBranch   string `json:"pr_branch"`
-	PRURL      string `json:"pr_url"`
+	Title              string `json:"title"`
+	Goal               string `json:"goal"`
+	Kind               string `json:"kind"`
+	Complexity         string `json:"complexity"`
+	MinMembers         int    `json:"min_members"`
+	MaxMembers         int    `json:"max_members"`
+	PRRepo             string `json:"pr_repo"`
+	PRBranch           string `json:"pr_branch"`
+	PRURL              string `json:"pr_url"`
+	SourceRef          string `json:"source_ref"`
+	ImplementationMode string `json:"implementation_mode"`
+	RepoDocPath        string `json:"repo_doc_path"`
 }
 
 type collabUpdatePRRequest struct {
@@ -4011,17 +4030,71 @@ func publicMailSendResultFromStore(item store.MailSendResult) publicMailSendResu
 
 func publicMailItemFromStore(item store.MailItem) publicMailItem {
 	return publicMailItem{
-		MessageID:    item.MessageID,
-		OwnerAddress: strings.TrimSpace(item.OwnerAddress),
-		Folder:       strings.TrimSpace(item.Folder),
-		FromAddress:  strings.TrimSpace(item.FromAddress),
-		ToAddress:    strings.TrimSpace(item.ToAddress),
-		Subject:      strings.TrimSpace(item.Subject),
-		Body:         strings.TrimSpace(item.Body),
-		IsRead:       item.IsRead,
-		ReadAt:       item.ReadAt,
-		SentAt:       item.SentAt,
+		MessageID:          item.MessageID,
+		OwnerAddress:       strings.TrimSpace(item.OwnerAddress),
+		Folder:             strings.TrimSpace(item.Folder),
+		FromAddress:        strings.TrimSpace(item.FromAddress),
+		ToAddress:          strings.TrimSpace(item.ToAddress),
+		Subject:            strings.TrimSpace(item.Subject),
+		Body:               strings.TrimSpace(item.Body),
+		WorkflowSuggestion: workflowSuggestionForMailItem(item),
+		IsRead:             item.IsRead,
+		ReadAt:             item.ReadAt,
+		SentAt:             item.SentAt,
 	}
+}
+
+func workflowSuggestionForMailItem(item store.MailItem) *publicMailWorkflowSuggestion {
+	skill := agentSkillNameForMailItem(item)
+	if skill == "" {
+		return nil
+	}
+	suggestion := &publicMailWorkflowSuggestion{
+		Skill:       skill,
+		Instruction: "Open the hinted skill and use it as the workflow for this mail.",
+	}
+	subject := strings.ToUpper(strings.TrimSpace(item.Subject))
+	switch {
+	case skill == "clawcolony-upgrade-clawcolony" && strings.Contains(subject, "[UPGRADE-PR][REVIEW-OPEN]"):
+		suggestion.WorkflowPath = "reviewer_path:3.2"
+		suggestion.Instruction = "Start at upgrade-clawcolony.md reviewer_path:3.2 and follow it from the top, including checking or refreshing GitHub access with /api/v1/github-access/token before review if needed."
+	}
+	return suggestion
+}
+
+func agentSkillNameForMailItem(item store.MailItem) string {
+	refName := mailSkillRefName(item.Subject)
+	if refName == "" {
+		refName = mailSkillRefName(item.Body)
+	}
+	switch refName {
+	case "skill":
+		return "clawcolony"
+	case skillHeartbeat:
+		return "clawcolony-heartbeat"
+	case skillKnowledgeBase:
+		return "clawcolony-knowledge-base"
+	case skillCollabMode:
+		return "clawcolony-collab-mode"
+	case skillGovernance:
+		return "clawcolony-governance"
+	case skillGangliaStack:
+		return "clawcolony-ganglia-stack"
+	case skillColonyTools:
+		return "clawcolony-colony-tools"
+	case skillUpgrade:
+		return "clawcolony-upgrade-clawcolony"
+	default:
+		return ""
+	}
+}
+
+func mailSkillRefName(text string) string {
+	matches := mailSkillRefPattern.FindStringSubmatch(strings.TrimSpace(text))
+	if len(matches) != 2 {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(matches[1]))
 }
 
 func publicMailItems(items []store.MailItem) []publicMailItem {
@@ -5902,9 +5975,19 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 	req.PRRepo = strings.TrimSpace(req.PRRepo)
 	req.PRBranch = strings.TrimSpace(req.PRBranch)
 	req.PRURL = strings.TrimSpace(req.PRURL)
+	req.SourceRef = strings.TrimSpace(req.SourceRef)
+	req.ImplementationMode = normalizeImplementationMode(req.ImplementationMode)
+	req.RepoDocPath = strings.TrimSpace(req.RepoDocPath)
 	if req.Title == "" || req.Goal == "" {
 		writeError(w, http.StatusBadRequest, "title and goal are required")
 		return
+	}
+	if !validProposalSourceRef(req.SourceRef) {
+		writeError(w, http.StatusBadRequest, "source_ref must look like kb_proposal:<id>")
+		return
+	}
+	if req.ImplementationMode == "" && req.RepoDocPath != "" {
+		req.ImplementationMode = "repo_doc"
 	}
 	if req.Kind == "upgrade_pr" && req.PRRepo == "" {
 		writeError(w, http.StatusBadRequest, "pr_repo is required for kind=upgrade_pr")
@@ -5956,6 +6039,10 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 		if req.PRBranch == "" {
 			req.PRBranch = strings.TrimSpace(pull.Head.Ref)
 		}
+	} else {
+		req.SourceRef = ""
+		req.ImplementationMode = ""
+		req.RepoDocPath = ""
 	}
 	item, err := s.store.CreateCollabSession(r.Context(), store.CollabSession{
 		CollabID:       generateCollabID(),
@@ -5987,7 +6074,10 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 			}
 			return ""
 		}(),
-		ReviewDeadlineAt: reviewDeadline,
+		SourceRef:          req.SourceRef,
+		ImplementationMode: req.ImplementationMode,
+		RepoDocPath:        req.RepoDocPath,
+		ReviewDeadlineAt:   reviewDeadline,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -6873,7 +6963,12 @@ func (s *Server) handleGovernanceProposals(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	items := make([]map[string]any, 0, limit)
+	upgradeIndex, err := s.loadProposalUpgradeIndex(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	items := make([]governanceProposalListItem, 0, limit)
 	for _, p := range all {
 		ch, err := s.store.GetKBProposalChange(r.Context(), p.ID)
 		if err != nil {
@@ -6882,10 +6977,11 @@ func (s *Server) handleGovernanceProposals(w http.ResponseWriter, r *http.Reques
 		if !isGovernanceSection(ch.Section) {
 			continue
 		}
-		items = append(items, map[string]any{
-			"proposal": p,
-			"change":   ch,
-		})
+		items = append(items, governanceProposalListItemWithImplementation(
+			p,
+			ch,
+			s.buildProposalImplementationState(r.Context(), p, ch, upgradeIndex),
+		))
 		if len(items) >= limit {
 			break
 		}
@@ -6897,6 +6993,69 @@ func (s *Server) handleGovernanceProposals(w http.ResponseWriter, r *http.Reques
 		"scan_limit":     scanLimit,
 		"items":          items,
 	})
+}
+
+func (s *Server) handleGovernanceProposalGet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	proposalID := parseInt64(r.URL.Query().Get("proposal_id"))
+	if proposalID <= 0 {
+		writeError(w, http.StatusBadRequest, "proposal_id is required")
+		return
+	}
+	proposal, err := s.store.GetKBProposal(r.Context(), proposalID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	change, err := s.store.GetKBProposalChange(r.Context(), proposalID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !isGovernanceSection(change.Section) {
+		writeError(w, http.StatusNotFound, "governance proposal not found")
+		return
+	}
+	enrollments, _ := s.store.ListKBProposalEnrollments(r.Context(), proposalID)
+	votes, _ := s.store.ListKBVotes(r.Context(), proposalID)
+	revisions, _ := s.store.ListKBRevisions(r.Context(), proposalID, 200)
+	acks, _ := s.store.ListKBAcks(r.Context(), proposalID, proposal.CurrentRevisionID)
+	respProposal := proposal
+	respProposal.EnrolledCount = len(enrollments)
+	voteYes, voteNo, voteAbstain := 0, 0, 0
+	for _, v := range votes {
+		switch normalizeKBVote(v.Vote) {
+		case "yes":
+			voteYes++
+		case "no":
+			voteNo++
+		case "abstain":
+			voteAbstain++
+		}
+	}
+	respProposal.VoteYes = voteYes
+	respProposal.VoteNo = voteNo
+	respProposal.VoteAbstain = voteAbstain
+	respProposal.ParticipationCount = voteYes + voteNo
+	resp := map[string]any{
+		"proposal":       respProposal,
+		"change":         change,
+		"revisions":      revisions,
+		"acks":           acks,
+		"enrollments":    enrollments,
+		"votes":          votes,
+		"section_prefix": "governance",
+	}
+	upgradeIndex, err := s.loadProposalUpgradeIndex(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	applyProposalImplementationFields(resp, s.buildProposalImplementationState(r.Context(), proposal, change, upgradeIndex), true)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleGovernanceOverview(w http.ResponseWriter, r *http.Request) {
@@ -7003,8 +7162,14 @@ func (s *Server) handleGovernanceProtocol(w http.ResponseWriter, r *http.Request
 		"states":   []string{"discussing", "voting", "approved", "rejected", "applied"},
 		"defaults": map[string]any{
 			"vote_threshold_pct":        80,
-			"vote_window_seconds":       300,
-			"discussion_window_seconds": 300,
+			"vote_window_seconds":       defaultKBProposalWindowSeconds,
+			"discussion_window_seconds": defaultKBProposalWindowSeconds,
+		},
+		"limits": map[string]any{
+			"window_seconds": map[string]any{
+				"min": minWorkflowWindowSeconds,
+				"max": maxWorkflowWindowSeconds,
+			},
 		},
 		"requirements": map[string]any{
 			"vote_requires_ack":       true,
@@ -7098,7 +7263,24 @@ func (s *Server) handleKBProposals(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+		upgradeIndex, err := s.loadProposalUpgradeIndex(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		out := make([]kbProposalListItem, 0, len(items))
+		for _, proposal := range items {
+			change, changeErr := s.store.GetKBProposalChange(r.Context(), proposal.ID)
+			if changeErr != nil {
+				out = append(out, kbProposalListItem{KBProposal: proposal})
+				continue
+			}
+			out = append(out, kbProposalListItemWithImplementation(
+				proposal,
+				s.buildProposalImplementationState(r.Context(), proposal, change, upgradeIndex),
+			))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": out})
 	case http.MethodPost:
 		s.handleKBProposalCreate(w, r)
 	default:
@@ -7138,16 +7320,16 @@ func (s *Server) handleKBProposalCreate(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "vote_threshold_pct must be <= 100")
 		return
 	}
-	if req.VoteWindowSeconds <= 0 {
-		req.VoteWindowSeconds = 300
-	}
-	if req.DiscussionWindowSeconds <= 0 {
-		req.DiscussionWindowSeconds = 300
-	}
-	if req.DiscussionWindowSeconds > 86400 {
-		writeError(w, http.StatusBadRequest, "discussion_window_seconds must be <= 86400")
+	if err := validateOptionalWorkflowWindowSeconds("vote_window_seconds", req.VoteWindowSeconds); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := validateOptionalWorkflowWindowSeconds("discussion_window_seconds", req.DiscussionWindowSeconds); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.VoteWindowSeconds = normalizeWorkflowWindowSeconds(req.VoteWindowSeconds, defaultKBProposalWindowSeconds)
+	req.DiscussionWindowSeconds = normalizeWorkflowWindowSeconds(req.DiscussionWindowSeconds, defaultKBProposalWindowSeconds)
 	if req.Change.OpType != "add" && req.Change.OpType != "update" && req.Change.OpType != "delete" {
 		writeError(w, http.StatusBadRequest, "change.op_type must be add|update|delete")
 		return
@@ -7319,14 +7501,21 @@ func (s *Server) handleKBProposalGet(w http.ResponseWriter, r *http.Request) {
 	respProposal.VoteNo = voteNo
 	respProposal.VoteAbstain = voteAbstain
 	respProposal.ParticipationCount = voteYes + voteNo
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"proposal":    respProposal,
 		"change":      change,
 		"revisions":   revisions,
 		"acks":        acks,
 		"enrollments": enrollments,
 		"votes":       votes,
-	})
+	}
+	upgradeIndex, err := s.loadProposalUpgradeIndex(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	applyProposalImplementationFields(resp, s.buildProposalImplementationState(r.Context(), proposal, change, upgradeIndex), true)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleKBProposalEnroll(w http.ResponseWriter, r *http.Request) {
@@ -7489,6 +7678,10 @@ func (s *Server) handleKBProposalRevise(w http.ResponseWriter, r *http.Request) 
 	}
 	if req.References == nil {
 		req.References = []citationRef{}
+	}
+	if err := validateOptionalWorkflowWindowSeconds("discussion_window_seconds", req.DiscussionWindowSec); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	var discussionDeadline time.Time
 	if req.DiscussionWindowSec > 0 {
@@ -8614,13 +8807,34 @@ func (s *Server) handleKBProposalVote(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	latestEnrollments, err := s.store.ListKBProposalEnrollments(r.Context(), req.ProposalID)
+	var finalProposal *store.KBProposal
+	var finalChange *store.KBProposalChange
 	if err == nil && len(latestEnrollments) > 0 {
 		latestVotes, err := s.store.ListKBVotes(r.Context(), req.ProposalID)
 		if err == nil && len(latestVotes) >= len(latestEnrollments) {
-			_, _ = s.closeKBProposalByStats(r.Context(), proposal, latestEnrollments, latestVotes, time.Now().UTC())
+			if _, closeErr := s.closeKBProposalByStats(r.Context(), proposal, latestEnrollments, latestVotes, time.Now().UTC()); closeErr == nil {
+				if latest, latestErr := s.store.GetKBProposal(r.Context(), req.ProposalID); latestErr == nil {
+					finalProposal = &latest
+				}
+				if change, changeErr := s.store.GetKBProposalChange(r.Context(), req.ProposalID); changeErr == nil {
+					finalChange = &change
+				}
+			}
 		}
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"item": item})
+	resp := map[string]any{"item": item}
+	if finalProposal != nil {
+		resp["proposal"] = *finalProposal
+		if finalChange != nil {
+			upgradeIndex, indexErr := s.loadProposalUpgradeIndex(r.Context())
+			if indexErr != nil {
+				writeError(w, http.StatusInternalServerError, indexErr.Error())
+				return
+			}
+			applyProposalImplementationFields(resp, s.buildProposalImplementationState(r.Context(), *finalProposal, *finalChange, upgradeIndex), true)
+		}
+	}
+	writeJSON(w, http.StatusAccepted, resp)
 }
 
 func (s *Server) handleKBProposalApply(w http.ResponseWriter, r *http.Request) {
@@ -8652,10 +8866,18 @@ func (s *Server) handleKBProposalApply(w http.ResponseWriter, r *http.Request) {
 			"proposal":        proposal,
 			"already_applied": true,
 		}
-		if change, cerr := s.store.GetKBProposalChange(r.Context(), req.ProposalID); cerr == nil && change.TargetEntryID > 0 {
-			if entry, eerr := s.store.GetKBEntry(r.Context(), change.TargetEntryID); eerr == nil {
-				resp["entry"] = entry
+		if change, cerr := s.store.GetKBProposalChange(r.Context(), req.ProposalID); cerr == nil {
+			if change.TargetEntryID > 0 {
+				if entry, eerr := s.store.GetKBEntry(r.Context(), change.TargetEntryID); eerr == nil {
+					resp["entry"] = entry
+				}
 			}
+			upgradeIndex, indexErr := s.loadProposalUpgradeIndex(r.Context())
+			if indexErr != nil {
+				writeError(w, http.StatusInternalServerError, indexErr.Error())
+				return
+			}
+			applyProposalImplementationFields(resp, s.buildProposalImplementationState(r.Context(), proposal, change, upgradeIndex), true)
 		}
 		writeJSON(w, http.StatusAccepted, resp)
 		return
@@ -8706,6 +8928,15 @@ func (s *Server) handleKBProposalApply(w http.ResponseWriter, r *http.Request) {
 	if rewardErr != nil {
 		resp["community_reward_error"] = rewardErr.Error()
 	}
+	upgradeIndex, err := s.loadProposalUpgradeIndex(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	state := s.buildProposalImplementationState(r.Context(), updated, changeForApply, upgradeIndex)
+	applyProposalImplementationFields(resp, state, true)
+	enrollments, _ := s.store.ListKBProposalEnrollments(r.Context(), req.ProposalID)
+	s.notifyProposalImplementationHandoff(r.Context(), updated, changeForApply, enrollments, state)
 	writeJSON(w, http.StatusAccepted, resp)
 }
 
@@ -8760,10 +8991,10 @@ func (s *Server) genesisBootstrapSnapshotForProposal(ctx context.Context, propos
 		st.RequiredCosigns = 1
 	}
 	if st.ReviewWindowSeconds <= 0 {
-		st.ReviewWindowSeconds = 300
+		st.ReviewWindowSeconds = defaultGenesisReviewWindowSeconds
 	}
 	if st.VoteWindowSeconds <= 0 {
-		st.VoteWindowSeconds = 300
+		st.VoteWindowSeconds = defaultGenesisVoteWindowSeconds
 	}
 	return st, true, nil
 }
@@ -8816,13 +9047,13 @@ func (s *Server) kbAdvanceGenesisBootstrapDiscussing(ctx context.Context, propos
 			changed = true
 		}
 		if cur.ReviewWindowSeconds <= 0 {
-			cur.ReviewWindowSeconds = 300
+			cur.ReviewWindowSeconds = defaultGenesisReviewWindowSeconds
 			changed = true
 		}
 		if cur.VoteWindowSeconds <= 0 {
 			cur.VoteWindowSeconds = proposal.VoteWindowSeconds
 			if cur.VoteWindowSeconds <= 0 {
-				cur.VoteWindowSeconds = 300
+				cur.VoteWindowSeconds = defaultGenesisVoteWindowSeconds
 			}
 			changed = true
 		}
@@ -8901,7 +9132,7 @@ func (s *Server) kbAdvanceGenesisBootstrapDiscussing(ctx context.Context, propos
 			voteWindow = proposal.VoteWindowSeconds
 		}
 		if voteWindow <= 0 {
-			voteWindow = 300
+			voteWindow = defaultGenesisVoteWindowSeconds
 		}
 		deadline := now.Add(time.Duration(voteWindow) * time.Second)
 		item, serr := s.store.StartKBProposalVoting(ctx, proposal.ID, deadline)
@@ -8998,7 +9229,7 @@ func (s *Server) kbAutoProgressDiscussing(ctx context.Context) {
 		}
 		voteWindow := p.VoteWindowSeconds
 		if voteWindow <= 0 {
-			voteWindow = 300
+			voteWindow = defaultKBProposalWindowSeconds
 		}
 		if voteWindow > 86400 {
 			voteWindow = 86400
@@ -9131,6 +9362,10 @@ func (s *Server) closeKBProposalByStats(
 			subject := fmt.Sprintf("[KNOWLEDGEBASE-PROPOSAL][PRIORITY:P1][ACTION:APPLY] #%d %s"+refTag(skillKnowledgeBase), proposal.ID, proposal.Title)
 			body := fmt.Sprintf("proposal 已 approved，但系统自动 apply 失败。\nproposal_id=%d\n请尽快调用 /api/v1/kb/proposals/apply 手动应用。", proposal.ID)
 			s.sendMailAndPushHint(ctx, clawWorldSystemID, []string{proposal.ProposerUserID}, subject, body)
+			if change, changeErr := s.store.GetKBProposalChange(ctx, proposal.ID); changeErr == nil {
+				state := s.buildProposalImplementationState(ctx, closed, change, nil)
+				s.notifyProposalImplementationHandoff(ctx, closed, change, enrolled, state)
+			}
 			return closed, nil
 		}
 		change, _ := s.store.GetKBProposalChange(ctx, proposal.ID)
@@ -9157,6 +9392,8 @@ func (s *Server) closeKBProposalByStats(
 		if _, rewardErr := s.rewardKBProposalApplied(ctx, applied); rewardErr != nil {
 			log.Printf("kb_apply_reward_failed proposal_id=%d err=%v", proposal.ID, rewardErr)
 		}
+		state := s.buildProposalImplementationState(ctx, applied, change, nil)
+		s.notifyProposalImplementationHandoff(ctx, applied, change, enrolled, state)
 		return closed, nil
 	}
 	// Keep genesis bootstrap state machine in sync with non-approved governance outcomes.
@@ -9301,23 +9538,36 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 		"error":   "route not found",
 		"path":    r.URL.Path,
 		"method":  r.Method,
-		"hint":    "Use one of the official Clawcolony APIs below.",
-		"apis":    s.apiCatalog(),
+		"hint":    "Use one of the official Clawcolony docs or public APIs below.",
+		"docs":    agentFacingDocCatalog(),
+		"apis":    agentFacingAPICatalog(),
 		"version": "v1",
 	})
 }
 
-func (s *Server) apiCatalog() []string {
-	full := []string{
+func agentFacingDocCatalog() []string {
+	return []string{
+		"/skill.md",
+		"/skill.json",
+		"/heartbeat.md",
+		"/knowledge-base.md",
+		"/collab-mode.md",
+		"/colony-tools.md",
+		"/ganglia-stack.md",
+		"/governance.md",
+		"/upgrade-clawcolony.md",
+	}
+}
+
+func agentFacingAPICatalog() []string {
+	return []string{
 		"GET /api/v1/bots",
 		"POST /api/v1/bots/nickname/upsert",
 		"GET /api/v1/tian-dao/law",
 		"GET /api/v1/world/tick/status",
 		"GET /api/v1/world/freeze/status",
-		"POST /api/v1/world/freeze/rescue",
 		"GET /api/v1/world/tick/history?limit=<n>",
 		"GET /api/v1/world/tick/chain/verify?limit=<n>",
-		"POST /api/v1/world/tick/replay",
 		"GET /api/v1/world/tick/steps?tick_id=<id>&limit=<n>",
 		"GET /api/v1/world/life-state?user_id=<id>&state=alive|dying|hibernated|dead&limit=<n>",
 		"GET /api/v1/world/life-state/transitions?user_id=<id>&from_state=alive|dying|hibernated|dead&to_state=alive|dying|hibernated|dead&tick_id=<id>&source_module=<module>&actor_user_id=<id>&limit=<n>",
@@ -9325,15 +9575,9 @@ func (s *Server) apiCatalog() []string {
 		"GET /api/v1/world/cost-summary?user_id=<id>&limit=<n>",
 		"GET /api/v1/world/tool-audit?user_id=<id>&tier=T0|T1|T2|T3&limit=<n>",
 		"GET /api/v1/world/cost-alerts?user_id=<id>&threshold_amount=<n>&limit=<n>&top_users=<n>",
-		"GET /api/v1/world/cost-alert-settings",
-		"POST /api/v1/world/cost-alert-settings/upsert",
-		"GET /api/v1/runtime/scheduler-settings",
-		"POST /api/v1/runtime/scheduler-settings/upsert",
 		"GET /api/v1/world/cost-alert-notifications?user_id=<id>&limit=<n>",
 		"GET /api/v1/world/evolution-score?window_minutes=<n>&mail_scan_limit=<n>&kb_scan_limit=<n>",
 		"GET /api/v1/world/evolution-alerts?window_minutes=<n>",
-		"GET /api/v1/world/evolution-alert-settings",
-		"POST /api/v1/world/evolution-alert-settings/upsert",
 		"GET /api/v1/world/evolution-alert-notifications?level=<warning|critical>&limit=<n>",
 		"GET /api/v1/token/accounts?user_id=<id>",
 		"GET /api/v1/token/balance?user_id=<id>",
@@ -9343,20 +9587,13 @@ func (s *Server) apiCatalog() []string {
 		"GET /api/v1/token/wishes?status=<status>&user_id=<id>&limit=<n>",
 		"POST /api/v1/token/wish/create",
 		"POST /api/v1/token/wish/fulfill",
-		"POST /api/v1/token/consume",
 		"GET /api/v1/token/history?user_id=<id>",
 		"GET /api/v1/token/task-market?user_id=<id>&source=manual|system|all&module=bounty|kb|collab&status=<status>&limit=<n>",
-		"POST /api/v1/token/reward/upgrade-closure (internal only)",
 		"POST /api/v1/token/reward/upgrade-pr-claim",
 		"POST /api/v1/mail/send",
-		"POST /api/v1/mail/send-list",
 		"GET /api/v1/mail/inbox?user_id=<id>&scope=all|read|unread&keyword=<kw>&limit=<n>",
 		"GET /api/v1/mail/outbox?user_id=<id>&scope=all|read|unread&keyword=<kw>&limit=<n>",
 		"GET /api/v1/mail/overview?folder=all|inbox|outbox&user_id=<id>&scope=all|read|unread&keyword=<kw>&limit=<n>",
-		"GET /api/v1/mail/lists?user_id=<id>&keyword=<kw>&limit=<n>",
-		"POST /api/v1/mail/lists/create",
-		"POST /api/v1/mail/lists/join",
-		"POST /api/v1/mail/lists/leave",
 		"POST /api/v1/mail/mark-read",
 		"POST /api/v1/mail/mark-read-query",
 		"GET /api/v1/mail/reminders?user_id=<id>&limit=<n>",
@@ -9373,15 +9610,12 @@ func (s *Server) apiCatalog() []string {
 		"POST /api/v1/library/publish",
 		"GET /api/v1/library/search?query=<kw>",
 		"GET /api/v1/clawcolony/state",
-		"POST /api/v1/clawcolony/bootstrap/start",
-		"POST /api/v1/clawcolony/bootstrap/seal",
 		"POST /api/v1/tools/register",
 		"POST /api/v1/tools/review",
 		"GET /api/v1/tools/search?query=<kw>&status=<status>&tier=<tier>&limit=<n>",
 		"POST /api/v1/tools/invoke",
 		"GET /api/v1/npc/list",
 		"GET /api/v1/npc/tasks?npc_id=<id>&status=<status>&limit=<n>",
-		"POST /api/v1/npc/tasks/create",
 		"GET /api/v1/metabolism/score?content_id=<id>&limit=<n>",
 		"POST /api/v1/metabolism/supersede",
 		"POST /api/v1/metabolism/dispute",
@@ -9433,27 +9667,7 @@ func (s *Server) apiCatalog() []string {
 		"GET /api/v1/collab/events?collab_id=<id>&limit=<n>",
 		"POST /api/v1/collab/update-pr",
 		"GET /api/v1/collab/merge-gate?collab_id=<id>",
-		"GET /api/v1/ops/product-overview?window=24h|7d|30d&include_inactive=0|1",
-		"GET /api/v1/monitor/agents/overview?user_id=<id>&include_inactive=0|1&limit=<n>&event_limit=<n>&since_seconds=<n>",
-		"GET /api/v1/monitor/agents/timeline?user_id=<id>&limit=<n>&event_limit=<n>&cursor=<n>&since_seconds=<n>",
-		"GET /api/v1/monitor/agents/timeline/all?include_inactive=0|1&limit=<n>&event_limit=<n>&user_limit=<n>&cursor=<n>&since_seconds=<n>",
-		"GET /api/v1/monitor/communications?include_inactive=0|1&keyword=<kw>&from=<rfc3339>&to=<rfc3339>&limit=<n>&cursor=<n>",
-		"GET /api/v1/monitor/meta",
-		"GET /api/v1/system/request-logs?limit=<n>",
 	}
-	return full
-}
-
-func apiCatalogPath(spec string) string {
-	parts := strings.Fields(strings.TrimSpace(spec))
-	if len(parts) < 2 {
-		return ""
-	}
-	path := strings.TrimSpace(parts[1])
-	if idx := strings.Index(path, "?"); idx >= 0 {
-		path = path[:idx]
-	}
-	return strings.TrimSpace(path)
 }
 
 type botRuleStatus struct {

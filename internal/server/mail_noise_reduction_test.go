@@ -12,14 +12,16 @@ import (
 	"clawcolony/internal/store"
 )
 
+const kbMailNoiseWindowSeconds = 3600
+
 func createKBProposalForMailNoiseTest(t *testing.T, srv *Server, proposer authUser, title, reason string) int64 {
 	t.Helper()
 	resp := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/kb/proposals", map[string]any{
 		"title":                     title,
 		"reason":                    reason,
 		"vote_threshold_pct":        50,
-		"vote_window_seconds":       300,
-		"discussion_window_seconds": 300,
+		"vote_window_seconds":       kbMailNoiseWindowSeconds,
+		"discussion_window_seconds": kbMailNoiseWindowSeconds,
 		"change": map[string]any{
 			"op_type":     "add",
 			"section":     "runtime-mail",
@@ -79,8 +81,8 @@ func TestKBPendingSummaryLimitsRecipientMailButPreservesBacklog(t *testing.T) {
 			"title":                     title,
 			"reason":                    "reduce repeated system mail by batching related work",
 			"vote_threshold_pct":        50,
-			"vote_window_seconds":       300,
-			"discussion_window_seconds": 300,
+			"vote_window_seconds":       kbMailNoiseWindowSeconds,
+			"discussion_window_seconds": kbMailNoiseWindowSeconds,
 			"change": map[string]any{
 				"op_type":     "add",
 				"section":     "runtime-mail",
@@ -597,8 +599,8 @@ func TestMailInboxAutoMarksClosedKBEnrollmentSummaryRead(t *testing.T) {
 		"title":                     "closed-enroll-summary",
 		"reason":                    "verify stale KB enrollment mail is auto-read once the window closes",
 		"vote_threshold_pct":        50,
-		"vote_window_seconds":       300,
-		"discussion_window_seconds": 300,
+		"vote_window_seconds":       kbMailNoiseWindowSeconds,
+		"discussion_window_seconds": kbMailNoiseWindowSeconds,
 		"change": map[string]any{
 			"op_type":     "add",
 			"section":     "runtime-mail",
@@ -658,8 +660,8 @@ func TestMailInboxAutoMarksClosedLegacyKBEnrollMailWithoutRevisionRead(t *testin
 		"title":                     "closed-legacy-enroll-no-revision",
 		"reason":                    "verify stale legacy KB enroll mail without revision fields is auto-read once the proposal closes",
 		"vote_threshold_pct":        50,
-		"vote_window_seconds":       300,
-		"discussion_window_seconds": 300,
+		"vote_window_seconds":       kbMailNoiseWindowSeconds,
+		"discussion_window_seconds": kbMailNoiseWindowSeconds,
 		"change": map[string]any{
 			"op_type":     "add",
 			"section":     "runtime-mail",
@@ -721,8 +723,8 @@ func TestMailRemindersAutoMarksClosedKBVoteReminderRead(t *testing.T) {
 		"title":                     "closed-vote-reminder",
 		"reason":                    "verify stale KB voting reminder is auto-read once the proposal closes",
 		"vote_threshold_pct":        50,
-		"vote_window_seconds":       300,
-		"discussion_window_seconds": 300,
+		"vote_window_seconds":       kbMailNoiseWindowSeconds,
+		"discussion_window_seconds": kbMailNoiseWindowSeconds,
 		"change": map[string]any{
 			"op_type":     "add",
 			"section":     "runtime-mail",
@@ -791,8 +793,8 @@ func TestMailRemindersAutoMarksClosedLegacyKBVoteReminderRead(t *testing.T) {
 		"title":                     "closed-legacy-vote-reminder",
 		"reason":                    "verify stale legacy KB vote reminder is auto-read once the proposal closes",
 		"vote_threshold_pct":        50,
-		"vote_window_seconds":       300,
-		"discussion_window_seconds": 300,
+		"vote_window_seconds":       kbMailNoiseWindowSeconds,
+		"discussion_window_seconds": kbMailNoiseWindowSeconds,
 		"change": map[string]any{
 			"op_type":     "add",
 			"section":     "runtime-mail",
@@ -868,8 +870,8 @@ func TestMailSystemResolveObsoleteKBDryRunDoesNotMutate(t *testing.T) {
 		"title":                     "obsolete-kb-dry-run",
 		"reason":                    "verify obsolete KB cleanup dry-run does not mutate unread mail",
 		"vote_threshold_pct":        50,
-		"vote_window_seconds":       300,
-		"discussion_window_seconds": 300,
+		"vote_window_seconds":       kbMailNoiseWindowSeconds,
+		"discussion_window_seconds": kbMailNoiseWindowSeconds,
 		"change": map[string]any{
 			"op_type":     "add",
 			"section":     "runtime-mail",
@@ -1214,8 +1216,8 @@ func TestMailSystemResolveObsoleteKBOnlyRequestedClasses(t *testing.T) {
 		"title":                     "obsolete-class-filter",
 		"reason":                    "verify obsolete cleanup only resolves explicitly requested classes",
 		"vote_threshold_pct":        50,
-		"vote_window_seconds":       300,
-		"discussion_window_seconds": 300,
+		"vote_window_seconds":       kbMailNoiseWindowSeconds,
+		"discussion_window_seconds": kbMailNoiseWindowSeconds,
 		"change": map[string]any{
 			"op_type":     "add",
 			"section":     "runtime-mail",
@@ -1325,8 +1327,8 @@ func TestMailSystemResolveObsoleteKBOnlyKBUpdatesClassLeavesKBPendingUnread(t *t
 		"title":                     "kb-pending-survives-kb-updated-cleanup",
 		"reason":                    "verify KB pending mail is untouched by kb_updates-only cleanup",
 		"vote_threshold_pct":        50,
-		"vote_window_seconds":       300,
-		"discussion_window_seconds": 300,
+		"vote_window_seconds":       kbMailNoiseWindowSeconds,
+		"discussion_window_seconds": kbMailNoiseWindowSeconds,
 		"change": map[string]any{
 			"op_type":     "add",
 			"section":     "runtime-mail",
@@ -1476,8 +1478,8 @@ func TestMailSystemResolveObsoleteKBScansRegisteredOwnersWithoutBots(t *testing.
 		"title":                     "obsolete-kb-registration-owner",
 		"reason":                    "verify obsolete KB cleanup scans registration owners even without bots",
 		"vote_threshold_pct":        50,
-		"vote_window_seconds":       300,
-		"discussion_window_seconds": 300,
+		"vote_window_seconds":       kbMailNoiseWindowSeconds,
+		"discussion_window_seconds": kbMailNoiseWindowSeconds,
 		"change": map[string]any{
 			"op_type":     "add",
 			"section":     "runtime-mail",

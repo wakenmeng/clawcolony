@@ -201,6 +201,50 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			END IF;
 		END
 		$$`,
+		`CREATE TABLE IF NOT EXISTS github_repo_access_grants (
+			owner_id BIGINT PRIMARY KEY,
+			github_user_id TEXT NOT NULL DEFAULT '',
+			github_username TEXT NOT NULL DEFAULT '',
+			mode TEXT NOT NULL DEFAULT '',
+			access_status TEXT NOT NULL DEFAULT '',
+			org TEXT NOT NULL DEFAULT '',
+			org_membership_status TEXT NOT NULL DEFAULT '',
+			team_slug TEXT NOT NULL DEFAULT '',
+			next_action TEXT NOT NULL DEFAULT '',
+			blocking_reason TEXT NOT NULL DEFAULT '',
+			installation_id TEXT NOT NULL DEFAULT '',
+			repository_id TEXT NOT NULL DEFAULT '',
+			repository_owner TEXT NOT NULL DEFAULT '',
+			repository_name TEXT NOT NULL DEFAULT '',
+			role TEXT NOT NULL DEFAULT '',
+			access_token_ciphertext TEXT NOT NULL DEFAULT '',
+			access_expires_at TIMESTAMPTZ NULL,
+			refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+			refresh_expires_at TIMESTAMPTZ NULL,
+			granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			last_verified_at TIMESTAMPTZ NULL,
+			revoked_at TIMESTAMPTZ NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`DO $$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_constraint WHERE conname = 'github_repo_access_grants_owner_id_fkey'
+			) THEN
+				ALTER TABLE github_repo_access_grants
+				ADD CONSTRAINT github_repo_access_grants_owner_id_fkey
+				FOREIGN KEY (owner_id) REFERENCES human_owners(owner_id);
+			END IF;
+		END
+		$$`,
+		`ALTER TABLE github_repo_access_grants ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE github_repo_access_grants ADD COLUMN IF NOT EXISTS access_status TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE github_repo_access_grants ADD COLUMN IF NOT EXISTS org TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE github_repo_access_grants ADD COLUMN IF NOT EXISTS org_membership_status TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE github_repo_access_grants ADD COLUMN IF NOT EXISTS team_slug TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE github_repo_access_grants ADD COLUMN IF NOT EXISTS next_action TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE github_repo_access_grants ADD COLUMN IF NOT EXISTS blocking_reason TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_human_bindings_owner ON agent_human_bindings(owner_id, updated_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS social_links (
 			user_id TEXT NOT NULL,
@@ -356,6 +400,9 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			pr_author_login TEXT NOT NULL DEFAULT '',
 			github_pr_state TEXT NOT NULL DEFAULT '',
 			pr_merge_commit_sha TEXT NOT NULL DEFAULT '',
+			source_ref TEXT NOT NULL DEFAULT '',
+			implementation_mode TEXT NOT NULL DEFAULT '',
+			repo_doc_path TEXT NOT NULL DEFAULT '',
 			status_summary TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -418,6 +465,9 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_author_login TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS github_pr_state TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_merge_commit_sha TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS source_ref TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS implementation_mode TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS repo_doc_path TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS review_deadline_at TIMESTAMPTZ NULL`,
 		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_merged_at TIMESTAMPTZ NULL`,
 		`ALTER TABLE collab_participants ADD COLUMN IF NOT EXISTS application_kind TEXT NOT NULL DEFAULT ''`,
@@ -445,7 +495,7 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			current_revision_id BIGINT NOT NULL DEFAULT 0,
 			voting_revision_id BIGINT NOT NULL DEFAULT 0,
 			vote_threshold_pct INT NOT NULL DEFAULT 80,
-			vote_window_seconds INT NOT NULL DEFAULT 300,
+			vote_window_seconds INT NOT NULL DEFAULT 3600,
 			enrolled_count INT NOT NULL DEFAULT 0,
 			vote_yes INT NOT NULL DEFAULT 0,
 			vote_no INT NOT NULL DEFAULT 0,
@@ -461,6 +511,7 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		`ALTER TABLE kb_proposals ADD COLUMN IF NOT EXISTS current_revision_id BIGINT NOT NULL DEFAULT 0`,
 		`ALTER TABLE kb_proposals ADD COLUMN IF NOT EXISTS voting_revision_id BIGINT NOT NULL DEFAULT 0`,
 		`ALTER TABLE kb_proposals ADD COLUMN IF NOT EXISTS discussion_deadline_at TIMESTAMPTZ NULL`,
+		`ALTER TABLE kb_proposals ALTER COLUMN vote_window_seconds SET DEFAULT 3600`,
 		`CREATE INDEX IF NOT EXISTS idx_kb_proposals_status_updated ON kb_proposals(status, updated_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS kb_proposal_changes (
 			id BIGSERIAL PRIMARY KEY,
@@ -2548,6 +2599,9 @@ func scanCollabSession(scanner interface{ Scan(dest ...any) error }, item *Colla
 		&item.PRAuthorLogin,
 		&item.GitHubPRState,
 		&item.PRMergeCommitSHA,
+		&item.SourceRef,
+		&item.ImplementationMode,
+		&item.RepoDocPath,
 		&item.LastStatusOrSummary,
 		&item.CreatedAt,
 		&item.UpdatedAt,
@@ -2603,16 +2657,19 @@ func (s *PostgresStore) CreateCollabSession(ctx context.Context, item CollabSess
 			orchestrator_user_id, min_members, max_members, required_reviewers,
 			pr_repo, pr_branch, pr_url, pr_number, pr_base_sha, pr_head_sha,
 			pr_author_login, github_pr_state, pr_merge_commit_sha,
+			source_ref, implementation_mode, repo_doc_path,
 			status_summary, created_at, updated_at, review_deadline_at, pr_merged_at, closed_at
 		)
-		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, NOW(), NOW(), $23, $24, $25)
+		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, NOW(), NOW(), $26, $27, $28)
 		RETURNING collab_id, title, goal, kind, complexity, phase, proposer_user_id, author_user_id, orchestrator_user_id,
 			min_members, max_members, required_reviewers, pr_repo, pr_branch, pr_url, pr_number, pr_base_sha, pr_head_sha,
 			pr_author_login, github_pr_state, pr_merge_commit_sha,
+			source_ref, implementation_mode, repo_doc_path,
 			status_summary, created_at, updated_at, review_deadline_at, pr_merged_at, closed_at
 	`, item.CollabID, item.Title, item.Goal, item.Kind, item.Complexity, item.Phase, item.ProposerUserID, item.AuthorUserID, item.OrchestratorUserID,
 		item.MinMembers, item.MaxMembers, item.RequiredReviewers, item.PRRepo, item.PRBranch, item.PRURL, item.PRNumber, item.PRBaseSHA, item.PRHeadSHA,
-		item.PRAuthorLogin, item.GitHubPRState, item.PRMergeCommitSHA, item.LastStatusOrSummary, item.ReviewDeadlineAt, item.PRMergedAt, item.ClosedAt)
+		item.PRAuthorLogin, item.GitHubPRState, item.PRMergeCommitSHA, item.SourceRef, item.ImplementationMode, item.RepoDocPath,
+		item.LastStatusOrSummary, item.ReviewDeadlineAt, item.PRMergedAt, item.ClosedAt)
 	if err := scanCollabSession(row, &item); err != nil {
 		return CollabSession{}, err
 	}
@@ -2625,6 +2682,7 @@ func (s *PostgresStore) GetCollabSession(ctx context.Context, collabID string) (
 		SELECT collab_id, title, goal, kind, complexity, phase, proposer_user_id, author_user_id, orchestrator_user_id,
 			min_members, max_members, required_reviewers, pr_repo, pr_branch, pr_url, pr_number, pr_base_sha, pr_head_sha,
 			pr_author_login, github_pr_state, pr_merge_commit_sha,
+			source_ref, implementation_mode, repo_doc_path,
 			status_summary, created_at, updated_at, review_deadline_at, pr_merged_at, closed_at
 		FROM collab_sessions WHERE collab_id = $1
 	`, strings.TrimSpace(collabID))
@@ -2645,6 +2703,7 @@ func (s *PostgresStore) ListCollabSessions(ctx context.Context, kind, phase, pro
 		SELECT collab_id, title, goal, kind, complexity, phase, proposer_user_id, author_user_id, orchestrator_user_id,
 			min_members, max_members, required_reviewers, pr_repo, pr_branch, pr_url, pr_number, pr_base_sha, pr_head_sha,
 			pr_author_login, github_pr_state, pr_merge_commit_sha,
+			source_ref, implementation_mode, repo_doc_path,
 			status_summary, created_at, updated_at, review_deadline_at, pr_merged_at, closed_at
 		FROM collab_sessions
 		WHERE ($1 = '' OR kind = $1)
@@ -2681,6 +2740,7 @@ func (s *PostgresStore) UpdateCollabPhase(ctx context.Context, collabID, phase, 
 		RETURNING collab_id, title, goal, kind, complexity, phase, proposer_user_id, author_user_id, orchestrator_user_id,
 			min_members, max_members, required_reviewers, pr_repo, pr_branch, pr_url, pr_number, pr_base_sha, pr_head_sha,
 			pr_author_login, github_pr_state, pr_merge_commit_sha,
+			source_ref, implementation_mode, repo_doc_path,
 			status_summary, created_at, updated_at, review_deadline_at, pr_merged_at, closed_at
 	`, strings.TrimSpace(collabID), strings.TrimSpace(phase), strings.TrimSpace(orchestratorUserID), strings.TrimSpace(statusSummary), closedAt)
 	if err := scanCollabSession(row, &item); err != nil {
@@ -2708,6 +2768,7 @@ func (s *PostgresStore) UpdateCollabPR(ctx context.Context, input CollabPRUpdate
 		RETURNING collab_id, title, goal, kind, complexity, phase, proposer_user_id, author_user_id, orchestrator_user_id,
 			min_members, max_members, required_reviewers, pr_repo, pr_branch, pr_url, pr_number, pr_base_sha, pr_head_sha,
 			pr_author_login, github_pr_state, pr_merge_commit_sha,
+			source_ref, implementation_mode, repo_doc_path,
 			status_summary, created_at, updated_at, review_deadline_at, pr_merged_at, closed_at
 	`, strings.TrimSpace(input.CollabID), strings.TrimSpace(input.PRBranch), strings.TrimSpace(input.PRURL), input.PRNumber, strings.TrimSpace(input.PRBaseSHA), strings.TrimSpace(input.PRHeadSHA), strings.TrimSpace(input.PRAuthorLogin), strings.TrimSpace(input.GitHubPRState), strings.TrimSpace(input.PRMergeCommitSHA), input.ReviewDeadlineAt, input.PRMergedAt)
 	if err := scanCollabSession(row, &item); err != nil {

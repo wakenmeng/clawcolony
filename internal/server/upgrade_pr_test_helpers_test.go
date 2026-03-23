@@ -72,6 +72,22 @@ func newFakeUpgradePRGitHub(t *testing.T, repo string, number int) *fakeUpgradeP
 			if err := json.NewEncoder(w).Encode(fixture.reviews); err != nil {
 				t.Fatalf("encode fake reviews: %v", err)
 			}
+		case strings.HasPrefix(r.URL.Path, fmt.Sprintf("/repos/%s/pulls/%d/reviews/", fixture.repo, fixture.number)):
+			idText := strings.TrimPrefix(r.URL.Path, fmt.Sprintf("/repos/%s/pulls/%d/reviews/", fixture.repo, fixture.number))
+			id, err := strconv.ParseInt(strings.TrimSpace(idText), 10, 64)
+			if err != nil {
+				http.Error(w, "bad review id", http.StatusBadRequest)
+				return
+			}
+			for _, review := range fixture.reviews {
+				if review.ID == id {
+					if err := json.NewEncoder(w).Encode(review); err != nil {
+						t.Fatalf("encode fake review: %v", err)
+					}
+					return
+				}
+			}
+			http.NotFound(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -91,6 +107,10 @@ func (f *fakeUpgradePRGitHub) commentURL(commentID int64) string {
 	return fmt.Sprintf("%s#issuecomment-%d", f.pullURL(), commentID)
 }
 
+func (f *fakeUpgradePRGitHub) reviewURL(reviewID int64) string {
+	return fmt.Sprintf("%s#pullrequestreview-%d", f.pullURL(), reviewID)
+}
+
 func makeUpgradePRApplyComment(repo string, number int, commentID int64, githubLogin, collabID, userID, note string) githubIssueCommentRecord {
 	comment := githubIssueCommentRecord{
 		ID:       commentID,
@@ -105,6 +125,20 @@ func makeUpgradePRApplyComment(repo string, number int, commentID int64, githubL
 	}
 	comment.User.Login = githubLogin
 	return comment
+}
+
+func makeUpgradePRAppliedReview(reviewID int64, githubLogin, userID, state, collabID, headSHA, judgement, summary, findings string, submittedAt time.Time) githubPullReviewRecord {
+	review := makeUpgradePRReview(reviewID, githubLogin, state, collabID, headSHA, judgement, summary, findings, submittedAt)
+	review.Body = fmt.Sprintf(
+		"[clawcolony-review-apply]\ncollab_id=%s\nuser_id=%s\nhead_sha=%s\njudgement=%s\nsummary=%s\nfindings=%s",
+		collabID,
+		userID,
+		headSHA,
+		judgement,
+		summary,
+		findings,
+	)
+	return review
 }
 
 func makeUpgradePRReview(reviewID int64, githubLogin, state, collabID, headSHA, judgement, summary, findings string, submittedAt time.Time) githubPullReviewRecord {
