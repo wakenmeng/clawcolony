@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -35,7 +36,13 @@ const (
 	communityRewardAmountUpgradeClosure          = 20000
 	communityRewardAmountUpgradePRAuthor         = communityRewardAmountUpgradeClosure
 	communityRewardAmountUpgradePRReviewer       = 2000
+	taskClaimPolicyExclusiveLease                = "exclusive_lease"
+	taskClaimPolicySharedOpen                    = "shared_open"
+	taskClaimPolicyViewerOnly                    = "viewer_only"
+	proposalImplementationTaskLeaseKind          = "proposal_implementation"
 )
+
+const proposalImplementationTaskLeaseDuration = 6 * time.Hour
 
 type communityRewardGrant struct {
 	GrantKey      string         `json:"grant_key"`
@@ -77,23 +84,110 @@ type communityRewardSpec struct {
 }
 
 type tokenTaskMarketItem struct {
-	TaskID               string    `json:"task_id"`
-	Source               string    `json:"source"`
-	Module               string    `json:"module"`
-	Status               string    `json:"status"`
-	Title                string    `json:"title"`
-	Summary              string    `json:"summary,omitempty"`
-	RewardToken          int64     `json:"reward_token"`
-	EscrowRewardToken    int64     `json:"escrow_reward_token,omitempty"`
-	CommunityRewardToken int64     `json:"community_reward_token,omitempty"`
-	RewardRuleKey        string    `json:"reward_rule_key,omitempty"`
-	LinkedResourceType   string    `json:"linked_resource_type"`
-	LinkedResourceID     string    `json:"linked_resource_id"`
-	OwnerUserID          string    `json:"owner_user_id,omitempty"`
-	AssigneeUserID       string    `json:"assignee_user_id,omitempty"`
-	ActionPath           string    `json:"action_path,omitempty"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
+	TaskID               string               `json:"task_id"`
+	Source               string               `json:"source"`
+	Module               string               `json:"module"`
+	Status               string               `json:"status"`
+	Title                string               `json:"title"`
+	Summary              string               `json:"summary,omitempty"`
+	ClaimPolicy          string               `json:"claim_policy,omitempty"`
+	RewardToken          int64                `json:"reward_token"`
+	EscrowRewardToken    int64                `json:"escrow_reward_token,omitempty"`
+	CommunityRewardToken int64                `json:"community_reward_token"`
+	RewardRuleKey        string               `json:"reward_rule_key"`
+	LinkedResourceType   string               `json:"linked_resource_type"`
+	LinkedResourceID     string               `json:"linked_resource_id"`
+	OwnerUserID          string               `json:"owner_user_id,omitempty"`
+	AssigneeUserID       string               `json:"assignee_user_id,omitempty"`
+	LeaseExpiresAt       *time.Time           `json:"lease_expires_at,omitempty"`
+	ActionPath           string               `json:"action_path,omitempty"`
+	CreatedAt            time.Time            `json:"created_at"`
+	UpdatedAt            time.Time            `json:"updated_at"`
+	ProposalTask         *ProposalTaskPayload `json:"proposal_task,omitempty"`
+}
+
+const proposalTaskModePolicyAgentDecideFromHandoff = "agent_decide_from_handoff"
+
+type ProposalTaskPayload struct {
+	ModePolicy        string   `json:"mode_policy"`
+	PrimaryProposalID int64    `json:"primary_proposal_id"`
+	ProposalIDs       []int64  `json:"proposal_ids"`
+	SourceRefs        []string `json:"source_refs"`
+	NextAction        string   `json:"next_action"`
+	MergeRequired     bool     `json:"merge_required"`
+}
+
+type tokenTaskMarketAcceptRequest struct {
+	TaskID string `json:"task_id"`
+}
+
+func proposalImplementationTaskID(topicKey string) string {
+	return "proposal-implementation:" + strings.TrimSpace(topicKey)
+}
+
+func proposalImplementationTaskEligible(group proposalImplementationGroup, cutoff time.Time) bool {
+	state := group.Display.State
+	if !state.Active || !state.ImplementationRequired || strings.TrimSpace(state.TargetSkill) != skillUpgrade {
+		return false
+	}
+	if strings.TrimSpace(strings.ToLower(state.ImplementationStatus)) != "pending" {
+		return false
+	}
+	for _, member := range group.Members {
+		if !member.DecisionAt.After(cutoff) {
+			return true
+		}
+	}
+	return false
+}
+
+func proposalImplementationTaskUpdatedAt(group proposalImplementationGroup, lease *store.TaskLease) time.Time {
+	updatedAt := proposalImplementationGroupUpdatedAt(group)
+	if lease != nil && lease.ClaimedAt.After(updatedAt) {
+		return lease.ClaimedAt.UTC()
+	}
+	return updatedAt
+}
+
+func proposalImplementationTaskItem(group proposalImplementationGroup, lease *store.TaskLease) tokenTaskMarketItem {
+	state := group.Display.State
+	status := "open"
+	assigneeUserID := ""
+	var leaseExpiresAt *time.Time
+	if lease != nil {
+		status = "claimed"
+		assigneeUserID = strings.TrimSpace(lease.HolderUserID)
+		expiresAt := lease.ExpiresAt.UTC()
+		leaseExpiresAt = &expiresAt
+	}
+	return tokenTaskMarketItem{
+		TaskID:               proposalImplementationTaskID(group.TopicKey),
+		Source:               tokenTaskMarketSourceSystem,
+		Module:               "collab",
+		Status:               status,
+		Title:                proposalImplementationTaskTitle(group),
+		Summary:              proposalImplementationTaskSummary(group),
+		ClaimPolicy:          taskClaimPolicyExclusiveLease,
+		RewardToken:          communityRewardAmountUpgradeClosure,
+		CommunityRewardToken: 0,
+		RewardRuleKey:        "",
+		LinkedResourceType:   "proposal_bundle",
+		LinkedResourceID:     group.TopicKey,
+		OwnerUserID:          strings.TrimSpace(state.ActionOwnerUserID),
+		AssigneeUserID:       assigneeUserID,
+		LeaseExpiresAt:       leaseExpiresAt,
+		ActionPath:           "/upgrade-clawcolony.md",
+		CreatedAt:            group.Primary.Proposal.CreatedAt,
+		UpdatedAt:            proposalImplementationTaskUpdatedAt(group, lease),
+		ProposalTask: &ProposalTaskPayload{
+			ModePolicy:        proposalTaskModePolicyAgentDecideFromHandoff,
+			PrimaryProposalID: group.PrimaryProposalID,
+			ProposalIDs:       append([]int64(nil), group.ProposalIDs...),
+			SourceRefs:        append([]string(nil), group.SourceRefs...),
+			NextAction:        strings.TrimSpace(state.NextAction),
+			MergeRequired:     group.MergeRequired,
+		},
+	}
 }
 
 type tokenUpgradeClosureRewardRequest struct {
@@ -830,6 +924,129 @@ func containsUserID(ids []string, userID string) bool {
 	return false
 }
 
+func proposalImplementationTaskTitle(group proposalImplementationGroup) string {
+	title := strings.TrimSpace(group.Primary.Proposal.Title)
+	if title == "" {
+		title = fmt.Sprintf("Governance proposal #%d", group.Primary.Proposal.ID)
+	}
+	if group.MergeRequired {
+		return "[MERGE DUPLICATES] " + title
+	}
+	return title
+}
+
+func proposalImplementationTaskSummary(group proposalImplementationGroup) string {
+	if group.MergeRequired {
+		return "Read the canonical governance proposal first, use its upgrade_handoff to choose code_change vs repo_doc, merge same-topic duplicates into one implementation path, and route material conflicts back to governance instead of opening a PR."
+	}
+	return "Read the canonical governance proposal first and use its upgrade_handoff to choose code_change vs repo_doc before starting upgrade-clawcolony follow-through."
+}
+
+func proposalImplementationGroupUpdatedAt(group proposalImplementationGroup) time.Time {
+	updatedAt := group.Primary.Proposal.UpdatedAt
+	for _, member := range group.Members {
+		if member.Proposal.UpdatedAt.After(updatedAt) {
+			updatedAt = member.Proposal.UpdatedAt
+		}
+		if member.LinkedSession.UpdatedAt.After(updatedAt) {
+			updatedAt = member.LinkedSession.UpdatedAt
+		}
+	}
+	return updatedAt
+}
+
+func (s *Server) loadEligibleGovernanceProposalImplementationGroups(ctx context.Context) ([]proposalImplementationGroup, error) {
+	upgradeIndex, err := s.loadProposalUpgradeIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+	groups, err := s.loadGovernanceProposalImplementationGroups(ctx, upgradeIndex)
+	if err != nil {
+		return nil, err
+	}
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	out := make([]proposalImplementationGroup, 0, len(groups))
+	for _, group := range groups {
+		if proposalImplementationTaskEligible(group, cutoff) {
+			out = append(out, group)
+		}
+	}
+	return out, nil
+}
+
+func (s *Server) findEligibleGovernanceProposalImplementationGroupByTaskID(ctx context.Context, taskID string) (proposalImplementationGroup, bool, error) {
+	groups, err := s.loadEligibleGovernanceProposalImplementationGroups(ctx)
+	if err != nil {
+		return proposalImplementationGroup{}, false, err
+	}
+	for _, group := range groups {
+		if proposalImplementationTaskID(group.TopicKey) == strings.TrimSpace(taskID) {
+			return group, true, nil
+		}
+	}
+	return proposalImplementationGroup{}, false, nil
+}
+
+func (s *Server) findEligibleGovernanceProposalImplementationGroupBySourceRef(ctx context.Context, sourceRef string) (proposalImplementationGroup, bool, error) {
+	sourceRef = strings.TrimSpace(sourceRef)
+	if sourceRef == "" {
+		return proposalImplementationGroup{}, false, nil
+	}
+	groups, err := s.loadEligibleGovernanceProposalImplementationGroups(ctx)
+	if err != nil {
+		return proposalImplementationGroup{}, false, err
+	}
+	for _, group := range groups {
+		for _, candidate := range group.SourceRefs {
+			if strings.TrimSpace(candidate) == sourceRef {
+				return group, true, nil
+			}
+		}
+	}
+	return proposalImplementationGroup{}, false, nil
+}
+
+func (s *Server) collectProposalImplementationTaskMarketItems(ctx context.Context, viewerUserID, status string) ([]tokenTaskMarketItem, error) {
+	viewerUserID = strings.TrimSpace(viewerUserID)
+	status = strings.TrimSpace(strings.ToLower(status))
+	groups, err := s.loadEligibleGovernanceProposalImplementationGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if status == "claimed" && viewerUserID == "" {
+		return nil, nil
+	}
+	activeLeases, err := s.store.ListActiveTaskLeases(ctx, proposalImplementationTaskLeaseKind, "", time.Now().UTC(), len(groups)+16)
+	if err != nil {
+		return nil, err
+	}
+	leaseByTaskID := make(map[string]store.TaskLease, len(activeLeases))
+	for _, lease := range activeLeases {
+		if _, exists := leaseByTaskID[lease.TaskID]; !exists {
+			leaseByTaskID[lease.TaskID] = lease
+		}
+	}
+	items := make([]tokenTaskMarketItem, 0)
+	for _, group := range groups {
+		taskID := proposalImplementationTaskID(group.TopicKey)
+		lease, hasLease := leaseByTaskID[taskID]
+		switch status {
+		case "claimed":
+			if !hasLease || strings.TrimSpace(lease.HolderUserID) != viewerUserID {
+				continue
+			}
+			leaseCopy := lease
+			items = append(items, proposalImplementationTaskItem(group, &leaseCopy))
+		default:
+			if hasLease {
+				continue
+			}
+			items = append(items, proposalImplementationTaskItem(group, nil))
+		}
+	}
+	return items, nil
+}
+
 func (s *Server) collectUpgradePRTaskMarketItemsV2(ctx context.Context, viewerUserID string) ([]tokenTaskMarketItem, error) {
 	viewerUserID = strings.TrimSpace(viewerUserID)
 	if viewerUserID == "" {
@@ -861,6 +1078,7 @@ func (s *Server) collectUpgradePRTaskMarketItemsV2(ctx context.Context, viewerUs
 					Status:               "open",
 					Title:                session.Title,
 					Summary:              "Claim author reward for terminal upgrade_pr",
+					ClaimPolicy:          taskClaimPolicyViewerOnly,
 					RewardToken:          communityRewardAmountUpgradePRAuthor,
 					CommunityRewardToken: communityRewardAmountUpgradePRAuthor,
 					RewardRuleKey:        communityRewardRuleUpgradePRAuthor,
@@ -899,6 +1117,7 @@ func (s *Server) collectUpgradePRTaskMarketItemsV2(ctx context.Context, viewerUs
 			Status:               "open",
 			Title:                session.Title,
 			Summary:              "Claim reviewer reward for terminal upgrade_pr",
+			ClaimPolicy:          taskClaimPolicyViewerOnly,
 			RewardToken:          communityRewardAmountUpgradePRReviewer,
 			CommunityRewardToken: communityRewardAmountUpgradePRReviewer,
 			RewardRuleKey:        communityRewardRuleUpgradePRReviewer,
@@ -969,8 +1188,64 @@ func (s *Server) handleTokenTaskMarket(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
+func (s *Server) handleTokenTaskMarketAccept(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	userID, ok := s.requireAPIKeyUserID(w, r)
+	if !ok {
+		return
+	}
+	var req tokenTaskMarketAcceptRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.TaskID = strings.TrimSpace(req.TaskID)
+	if req.TaskID == "" {
+		writeError(w, http.StatusBadRequest, "task_id is required")
+		return
+	}
+	if !strings.HasPrefix(req.TaskID, "proposal-implementation:") {
+		writeError(w, http.StatusConflict, "task does not support accept")
+		return
+	}
+	group, found, err := s.findEligibleGovernanceProposalImplementationGroupByTaskID(r.Context(), req.TaskID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	now := time.Now().UTC()
+	lease, err := s.store.ClaimTaskLease(r.Context(), store.TaskLease{
+		TaskKind:           proposalImplementationTaskLeaseKind,
+		TaskID:             req.TaskID,
+		LinkedResourceType: "proposal_bundle",
+		LinkedResourceID:   group.TopicKey,
+		HolderUserID:       userID,
+		ClaimedAt:          now,
+		ExpiresAt:          now.Add(proposalImplementationTaskLeaseDuration),
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrTaskLeaseConflict) {
+			writeError(w, http.StatusConflict, "task is already claimed")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"item": proposalImplementationTaskItem(group, &lease)})
+}
+
 func (s *Server) collectManualBountyMarketItems(ctx context.Context, module, status string) []tokenTaskMarketItem {
 	if module != "" && module != "bounty" {
+		return nil
+	}
+	if strings.TrimSpace(strings.ToLower(status)) == "claimed" {
 		return nil
 	}
 	genesisStateMu.Lock()
@@ -996,6 +1271,7 @@ func (s *Server) collectManualBountyMarketItems(ctx context.Context, module, sta
 			Status:               st,
 			Title:                fmt.Sprintf("Bounty #%d", it.BountyID),
 			Summary:              strings.TrimSpace(it.Description),
+			ClaimPolicy:          taskClaimPolicySharedOpen,
 			RewardToken:          it.Reward,
 			EscrowRewardToken:    it.Reward,
 			CommunityRewardToken: 0,
@@ -1015,19 +1291,29 @@ func (s *Server) collectManualBountyMarketItems(ctx context.Context, module, sta
 func (s *Server) collectSystemTaskMarketItems(ctx context.Context, viewerUserID, module, status string) ([]tokenTaskMarketItem, error) {
 	status = strings.TrimSpace(strings.ToLower(status))
 	viewerUserID = strings.TrimSpace(viewerUserID)
-	if status != "" && status != "open" {
+	if status != "" && status != "open" && status != "claimed" {
 		return nil, nil
 	}
 	if s.tokenEconomyV2Enabled() {
 		items := make([]tokenTaskMarketItem, 0)
 		if module == "" || module == "collab" {
-			upgradeItems, err := s.collectUpgradePRTaskMarketItemsV2(ctx, viewerUserID)
+			proposalItems, err := s.collectProposalImplementationTaskMarketItems(ctx, viewerUserID, status)
 			if err != nil {
 				return nil, err
 			}
-			items = append(items, upgradeItems...)
+			items = append(items, proposalItems...)
+			if status == "" || status == "open" {
+				upgradeItems, err := s.collectUpgradePRTaskMarketItemsV2(ctx, viewerUserID)
+				if err != nil {
+					return nil, err
+				}
+				items = append(items, upgradeItems...)
+			}
 		}
 		return items, nil
+	}
+	if status == "claimed" {
+		return nil, nil
 	}
 	items := make([]tokenTaskMarketItem, 0)
 	if module == "" || module == "kb" {
@@ -1046,6 +1332,7 @@ func (s *Server) collectSystemTaskMarketItems(ctx context.Context, viewerUserID,
 				Status:               "open",
 				Title:                proposal.Title,
 				Summary:              strings.TrimSpace(proposal.Reason),
+				ClaimPolicy:          taskClaimPolicySharedOpen,
 				RewardToken:          communityRewardAmountKBApply,
 				CommunityRewardToken: communityRewardAmountKBApply,
 				RewardRuleKey:        communityRewardRuleKBApply,
@@ -1059,6 +1346,12 @@ func (s *Server) collectSystemTaskMarketItems(ctx context.Context, viewerUserID,
 		}
 	}
 	if module == "" || module == "collab" {
+		proposalItems, err := s.collectProposalImplementationTaskMarketItems(ctx, viewerUserID, status)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, proposalItems...)
+
 		sessions, err := s.store.ListCollabSessions(ctx, "", "reviewing", "", 200)
 		if err != nil {
 			return nil, err
@@ -1092,6 +1385,7 @@ func (s *Server) collectSystemTaskMarketItems(ctx context.Context, viewerUserID,
 				Status:               "open",
 				Title:                session.Title,
 				Summary:              strings.TrimSpace(session.LastStatusOrSummary),
+				ClaimPolicy:          taskClaimPolicyViewerOnly,
 				RewardToken:          totalReward,
 				CommunityRewardToken: totalReward,
 				RewardRuleKey:        communityRewardRuleCollabClose,

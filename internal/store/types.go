@@ -14,6 +14,8 @@ var ErrBotNotFound = errors.New("bot not found")
 var ErrBotNameTaken = errors.New("bot username already taken by an active user")
 var ErrWorldTickNotFound = errors.New("world tick not found")
 var ErrUserLifeStateNotFound = errors.New("user life state not found")
+var ErrTaskLeaseConflict = errors.New("task lease conflict")
+var ErrTaskLeaseNotFound = errors.New("task lease not found")
 
 func costEventRecipientUserID(metaJSON string) string {
 	if strings.TrimSpace(metaJSON) == "" {
@@ -218,6 +220,17 @@ type CollabPRUpdate struct {
 	PRMergeCommitSHA string
 	ReviewDeadlineAt *time.Time
 	PRMergedAt       *time.Time
+}
+
+type TaskLease struct {
+	TaskKind           string     `json:"task_kind"`
+	TaskID             string     `json:"task_id"`
+	LinkedResourceType string     `json:"linked_resource_type,omitempty"`
+	LinkedResourceID   string     `json:"linked_resource_id,omitempty"`
+	HolderUserID       string     `json:"holder_user_id"`
+	ClaimedAt          time.Time  `json:"claimed_at"`
+	ExpiresAt          time.Time  `json:"expires_at"`
+	ConsumedAt         *time.Time `json:"consumed_at,omitempty"`
 }
 
 type CollabArtifact struct {
@@ -676,6 +689,10 @@ type Store interface {
 	Transfer(ctx context.Context, fromBotID, toBotID string, amount int64) (TokenTransfer, error)
 	TransferWithFloor(ctx context.Context, fromBotID, toBotID string, amount int64) (TokenTransfer, error)
 	ListTokenLedger(ctx context.Context, botID string, limit int) ([]TokenLedger, error)
+	ClaimTaskLease(ctx context.Context, item TaskLease) (TaskLease, error)
+	GetActiveTaskLease(ctx context.Context, taskKind, taskID string, now time.Time) (TaskLease, bool, error)
+	ListActiveTaskLeases(ctx context.Context, taskKind, holderUserID string, now time.Time, limit int) ([]TaskLease, error)
+	ConsumeTaskLease(ctx context.Context, taskKind, taskID, holderUserID string, consumedAt time.Time) (TaskLease, error)
 	CreateCollabSession(ctx context.Context, item CollabSession) (CollabSession, error)
 	GetCollabSession(ctx context.Context, collabID string) (CollabSession, error)
 	ListCollabSessions(ctx context.Context, kind, phase, proposerUserID string, limit int) ([]CollabSession, error)

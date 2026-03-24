@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -67,6 +68,27 @@ type proposalImplementationState struct {
 	TakeoverAllowed            bool
 	LinkedUpgrade              *proposalLinkedUpgrade
 	UpgradeHandoff             *proposalUpgradeHandoff
+}
+
+type proposalImplementationGroupMember struct {
+	Proposal      store.KBProposal
+	Change        store.KBProposalChange
+	SourceRef     string
+	DecisionAt    time.Time
+	TopicKey      string
+	LinkedSession store.CollabSession
+	State         proposalImplementationState
+}
+
+type proposalImplementationGroup struct {
+	TopicKey          string
+	PrimaryProposalID int64
+	ProposalIDs       []int64
+	SourceRefs        []string
+	MergeRequired     bool
+	Primary           proposalImplementationGroupMember
+	Display           proposalImplementationGroupMember
+	Members           []proposalImplementationGroupMember
 }
 
 type proposalActorIdentity struct {
@@ -279,6 +301,229 @@ func (s *Server) loadProposalUpgradeIndex(ctx context.Context) (map[string]store
 		}
 	}
 	return index, nil
+}
+
+func proposalDecisionTime(proposal store.KBProposal) time.Time {
+	switch {
+	case proposal.AppliedAt != nil && !proposal.AppliedAt.IsZero():
+		return proposal.AppliedAt.UTC()
+	case proposal.ClosedAt != nil && !proposal.ClosedAt.IsZero():
+		return proposal.ClosedAt.UTC()
+	default:
+		return proposal.UpdatedAt.UTC()
+	}
+}
+
+func proposalImplementationTopicKey(category string, proposal store.KBProposal, change store.KBProposalChange) string {
+	targetKey := ""
+	switch {
+	case change.TargetEntryID > 0 && !strings.EqualFold(strings.TrimSpace(change.OpType), "add"):
+		targetKey = fmt.Sprintf("entry:%d", change.TargetEntryID)
+	default:
+		title := strings.TrimSpace(change.Title)
+		if title == "" {
+			title = strings.TrimSpace(proposal.Title)
+		}
+		title = slugIdentifier(title)
+		if title == "" {
+			title = "untitled"
+		}
+		targetKey = "title:" + title
+	}
+	return strings.Join([]string{
+		slugIdentifier(category),
+		slugIdentifier(change.Section),
+		slugIdentifier(change.OpType),
+		targetKey,
+	}, "|")
+}
+
+func proposalPrimaryCandidateLess(a, b proposalImplementationGroupMember) bool {
+	aHasUpgrade := a.State.LinkedUpgrade != nil && strings.TrimSpace(a.State.LinkedUpgrade.CollabID) != ""
+	bHasUpgrade := b.State.LinkedUpgrade != nil && strings.TrimSpace(b.State.LinkedUpgrade.CollabID) != ""
+	if aHasUpgrade != bHasUpgrade {
+		return aHasUpgrade
+	}
+	aApplied := strings.EqualFold(strings.TrimSpace(a.Proposal.Status), "applied")
+	bApplied := strings.EqualFold(strings.TrimSpace(b.Proposal.Status), "applied")
+	if aApplied != bApplied {
+		return aApplied
+	}
+	if !a.DecisionAt.Equal(b.DecisionAt) {
+		return a.DecisionAt.After(b.DecisionAt)
+	}
+	return a.Proposal.ID < b.Proposal.ID
+}
+
+func proposalDisplayCandidateRank(member proposalImplementationGroupMember) int {
+	if member.State.LinkedUpgrade == nil || strings.TrimSpace(member.State.LinkedUpgrade.CollabID) == "" {
+		return 0
+	}
+	if member.State.LinkedUpgrade.Merged {
+		return 3
+	}
+	if strings.EqualFold(strings.TrimSpace(member.State.LinkedUpgrade.Phase), "failed") {
+		return 1
+	}
+	return 2
+}
+
+func proposalDisplayCandidateLess(a, b proposalImplementationGroupMember) bool {
+	aRank := proposalDisplayCandidateRank(a)
+	bRank := proposalDisplayCandidateRank(b)
+	if aRank != bRank {
+		return aRank > bRank
+	}
+	if !a.LinkedSession.UpdatedAt.Equal(b.LinkedSession.UpdatedAt) {
+		return a.LinkedSession.UpdatedAt.After(b.LinkedSession.UpdatedAt)
+	}
+	return proposalPrimaryCandidateLess(a, b)
+}
+
+func overlayProposalImplementationState(base proposalImplementationState, group proposalImplementationGroup) proposalImplementationState {
+	if !base.Active {
+		return base
+	}
+	base.Category = group.Display.State.Category
+	base.NextAction = group.Display.State.NextAction
+	base.ImplementationRequired = group.Display.State.ImplementationRequired
+	base.TargetSkill = group.Display.State.TargetSkill
+	base.ImplementationStatus = group.Display.State.ImplementationStatus
+	base.ActionOwnerUserID = group.Display.State.ActionOwnerUserID
+	base.ActionOwnerRuntimeUsername = group.Display.State.ActionOwnerRuntimeUsername
+	base.TakeoverAllowed = group.Display.State.TakeoverAllowed
+	base.LinkedUpgrade = group.Display.State.LinkedUpgrade
+	return base
+}
+
+func (s *Server) buildProposalImplementationStateWithGroups(
+	ctx context.Context,
+	proposal store.KBProposal,
+	change store.KBProposalChange,
+	upgradeIndex map[string]store.CollabSession,
+	groupIndex map[int64]proposalImplementationGroup,
+) proposalImplementationState {
+	state := s.buildProposalImplementationState(ctx, proposal, change, upgradeIndex)
+	if !state.Active {
+		return state
+	}
+	group, ok := groupIndex[proposal.ID]
+	if !ok {
+		return state
+	}
+	return overlayProposalImplementationState(state, group)
+}
+
+func proposalImplementationGroupIndex(groups []proposalImplementationGroup) map[int64]proposalImplementationGroup {
+	index := make(map[int64]proposalImplementationGroup, len(groups))
+	for _, group := range groups {
+		for _, member := range group.Members {
+			index[member.Proposal.ID] = group
+		}
+	}
+	return index
+}
+
+func (s *Server) loadGovernanceProposalImplementationGroups(
+	ctx context.Context,
+	upgradeIndex map[string]store.CollabSession,
+) ([]proposalImplementationGroup, error) {
+	const proposalScanLimit = 500
+
+	statuses := []string{"approved", "applied"}
+	seen := make(map[int64]store.KBProposal)
+	for _, status := range statuses {
+		proposals, err := s.store.ListKBProposals(ctx, status, proposalScanLimit)
+		if err != nil {
+			return nil, err
+		}
+		for _, proposal := range proposals {
+			seen[proposal.ID] = proposal
+		}
+	}
+
+	grouped := make(map[string][]proposalImplementationGroupMember)
+	for _, proposal := range seen {
+		change, err := s.store.GetKBProposalChange(ctx, proposal.ID)
+		if err != nil {
+			continue
+		}
+		category := s.proposalKnowledgeCategory(ctx, proposal, change)
+		if !strings.EqualFold(strings.TrimSpace(category), "governance") {
+			continue
+		}
+		state := s.buildProposalImplementationState(ctx, proposal, change, upgradeIndex)
+		if !state.Active {
+			continue
+		}
+		sourceRef := proposalSourceRefString(proposal.ID)
+		member := proposalImplementationGroupMember{
+			Proposal:      proposal,
+			Change:        change,
+			SourceRef:     sourceRef,
+			DecisionAt:    proposalDecisionTime(proposal),
+			TopicKey:      proposalImplementationTopicKey(category, proposal, change),
+			LinkedSession: upgradeIndex[sourceRef],
+			State:         state,
+		}
+		grouped[member.TopicKey] = append(grouped[member.TopicKey], member)
+	}
+
+	keys := make([]string, 0, len(grouped))
+	for topicKey := range grouped {
+		keys = append(keys, topicKey)
+	}
+	sort.Strings(keys)
+
+	out := make([]proposalImplementationGroup, 0, len(keys))
+	for _, topicKey := range keys {
+		members := grouped[topicKey]
+		if len(members) == 0 {
+			continue
+		}
+		sort.SliceStable(members, func(i, j int) bool {
+			return proposalPrimaryCandidateLess(members[i], members[j])
+		})
+		primary := members[0]
+		display := members[0]
+		for _, member := range members[1:] {
+			if proposalDisplayCandidateLess(member, display) {
+				display = member
+			}
+		}
+
+		proposalIDs := make([]int64, 0, len(members))
+		sourceRefs := make([]string, 0, len(members))
+		for _, member := range members {
+			proposalIDs = append(proposalIDs, member.Proposal.ID)
+			sourceRefs = append(sourceRefs, member.SourceRef)
+		}
+		sort.SliceStable(proposalIDs, func(i, j int) bool { return proposalIDs[i] < proposalIDs[j] })
+		sort.Strings(sourceRefs)
+
+		out = append(out, proposalImplementationGroup{
+			TopicKey:          topicKey,
+			PrimaryProposalID: primary.Proposal.ID,
+			ProposalIDs:       proposalIDs,
+			SourceRefs:        sourceRefs,
+			MergeRequired:     len(members) > 1,
+			Primary:           primary,
+			Display:           display,
+			Members:           members,
+		})
+	}
+	return out, nil
+}
+
+func (s *Server) loadGovernanceProposalImplementationGroupIndex(
+	ctx context.Context,
+	upgradeIndex map[string]store.CollabSession,
+) (map[int64]proposalImplementationGroup, error) {
+	groups, err := s.loadGovernanceProposalImplementationGroups(ctx, upgradeIndex)
+	if err != nil {
+		return nil, err
+	}
+	return proposalImplementationGroupIndex(groups), nil
 }
 
 func proposalRepoDocPath(category string, proposalID int64, title string) (string, string, string, string) {

@@ -475,6 +475,19 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		`ALTER TABLE collab_participants ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE`,
 		`ALTER TABLE collab_participants ADD COLUMN IF NOT EXISTS github_login TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_collab_sessions_kind ON collab_sessions(kind, phase, updated_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS task_leases (
+			id BIGSERIAL PRIMARY KEY,
+			task_kind TEXT NOT NULL,
+			task_id TEXT NOT NULL,
+			linked_resource_type TEXT NOT NULL DEFAULT '',
+			linked_resource_id TEXT NOT NULL DEFAULT '',
+			holder_user_id TEXT NOT NULL,
+			claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			expires_at TIMESTAMPTZ NOT NULL,
+			consumed_at TIMESTAMPTZ NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_task_leases_task_claimed ON task_leases(task_kind, task_id, claimed_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_task_leases_holder_claimed ON task_leases(task_kind, holder_user_id, claimed_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS kb_entries (
 			id BIGSERIAL PRIMARY KEY,
 			section TEXT NOT NULL DEFAULT '',
@@ -2644,6 +2657,179 @@ func scanCollabParticipant(scanner interface{ Scan(dest ...any) error }, item *C
 		&item.CreatedAt,
 		&item.UpdatedAt,
 	)
+}
+
+func scanTaskLease(scanner interface{ Scan(dest ...any) error }, item *TaskLease) error {
+	var consumed sql.NullTime
+	if err := scanner.Scan(
+		&item.TaskKind,
+		&item.TaskID,
+		&item.LinkedResourceType,
+		&item.LinkedResourceID,
+		&item.HolderUserID,
+		&item.ClaimedAt,
+		&item.ExpiresAt,
+		&consumed,
+	); err != nil {
+		return err
+	}
+	if consumed.Valid {
+		item.ConsumedAt = &consumed.Time
+	} else {
+		item.ConsumedAt = nil
+	}
+	return nil
+}
+
+func (s *PostgresStore) ClaimTaskLease(ctx context.Context, item TaskLease) (TaskLease, error) {
+	item.TaskKind = strings.TrimSpace(item.TaskKind)
+	item.TaskID = strings.TrimSpace(item.TaskID)
+	item.HolderUserID = strings.TrimSpace(item.HolderUserID)
+	item.LinkedResourceType = strings.TrimSpace(item.LinkedResourceType)
+	item.LinkedResourceID = strings.TrimSpace(item.LinkedResourceID)
+	if item.TaskKind == "" || item.TaskID == "" || item.HolderUserID == "" {
+		return TaskLease{}, fmt.Errorf("task_kind, task_id, and holder_user_id are required")
+	}
+	item.ClaimedAt = item.ClaimedAt.UTC()
+	item.ExpiresAt = item.ExpiresAt.UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return TaskLease{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`, item.TaskKind, item.TaskID); err != nil {
+		return TaskLease{}, err
+	}
+	var existing int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT id
+		FROM task_leases
+		WHERE task_kind = $1
+		  AND task_id = $2
+		  AND consumed_at IS NULL
+		  AND expires_at > $3
+		ORDER BY claimed_at DESC, id DESC
+		LIMIT 1
+	`, item.TaskKind, item.TaskID, item.ClaimedAt).Scan(&existing)
+	switch {
+	case err == nil:
+		return TaskLease{}, ErrTaskLeaseConflict
+	case !errors.Is(err, sql.ErrNoRows):
+		return TaskLease{}, err
+	}
+	row := tx.QueryRowContext(ctx, `
+		INSERT INTO task_leases(
+			task_kind, task_id, linked_resource_type, linked_resource_id, holder_user_id, claimed_at, expires_at, consumed_at
+		)
+		VALUES($1, $2, $3, $4, $5, $6, $7, NULL)
+		RETURNING task_kind, task_id, linked_resource_type, linked_resource_id, holder_user_id, claimed_at, expires_at, consumed_at
+	`, item.TaskKind, item.TaskID, item.LinkedResourceType, item.LinkedResourceID, item.HolderUserID, item.ClaimedAt, item.ExpiresAt)
+	if err := scanTaskLease(row, &item); err != nil {
+		return TaskLease{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return TaskLease{}, err
+	}
+	return item, nil
+}
+
+func (s *PostgresStore) GetActiveTaskLease(ctx context.Context, taskKind, taskID string, now time.Time) (TaskLease, bool, error) {
+	var item TaskLease
+	row := s.db.QueryRowContext(ctx, `
+		SELECT task_kind, task_id, linked_resource_type, linked_resource_id, holder_user_id, claimed_at, expires_at, consumed_at
+		FROM task_leases
+		WHERE task_kind = $1
+		  AND task_id = $2
+		  AND consumed_at IS NULL
+		  AND expires_at > $3
+		ORDER BY claimed_at DESC, id DESC
+		LIMIT 1
+	`, strings.TrimSpace(taskKind), strings.TrimSpace(taskID), now.UTC())
+	if err := scanTaskLease(row, &item); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return TaskLease{}, false, nil
+		}
+		return TaskLease{}, false, err
+	}
+	return item, true, nil
+}
+
+func (s *PostgresStore) ListActiveTaskLeases(ctx context.Context, taskKind, holderUserID string, now time.Time, limit int) ([]TaskLease, error) {
+	taskKind = strings.TrimSpace(taskKind)
+	holderUserID = strings.TrimSpace(holderUserID)
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT task_kind, task_id, linked_resource_type, linked_resource_id, holder_user_id, claimed_at, expires_at, consumed_at
+		FROM task_leases
+		WHERE ($1 = '' OR task_kind = $1)
+		  AND ($2 = '' OR holder_user_id = $2)
+		  AND consumed_at IS NULL
+		  AND expires_at > $3
+		ORDER BY claimed_at DESC, id DESC
+		LIMIT $4
+	`, taskKind, holderUserID, now.UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]TaskLease, 0)
+	for rows.Next() {
+		var item TaskLease
+		if err := scanTaskLease(rows, &item); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) ConsumeTaskLease(ctx context.Context, taskKind, taskID, holderUserID string, consumedAt time.Time) (TaskLease, error) {
+	taskKind = strings.TrimSpace(taskKind)
+	taskID = strings.TrimSpace(taskID)
+	holderUserID = strings.TrimSpace(holderUserID)
+	if taskKind == "" || taskID == "" || holderUserID == "" {
+		return TaskLease{}, fmt.Errorf("task_kind, task_id, and holder_user_id are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return TaskLease{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`, taskKind, taskID); err != nil {
+		return TaskLease{}, err
+	}
+	var item TaskLease
+	row := tx.QueryRowContext(ctx, `
+		UPDATE task_leases
+		SET consumed_at = $4
+		WHERE id = (
+			SELECT id
+			FROM task_leases
+			WHERE task_kind = $1
+			  AND task_id = $2
+			  AND holder_user_id = $3
+			  AND consumed_at IS NULL
+			  AND expires_at > $4
+			ORDER BY claimed_at DESC, id DESC
+			LIMIT 1
+		)
+		RETURNING task_kind, task_id, linked_resource_type, linked_resource_id, holder_user_id, claimed_at, expires_at, consumed_at
+	`, taskKind, taskID, holderUserID, consumedAt.UTC())
+	if err := scanTaskLease(row, &item); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return TaskLease{}, ErrTaskLeaseNotFound
+		}
+		return TaskLease{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return TaskLease{}, err
+	}
+	return item, nil
 }
 
 func (s *PostgresStore) CreateCollabSession(ctx context.Context, item CollabSession) (CollabSession, error) {

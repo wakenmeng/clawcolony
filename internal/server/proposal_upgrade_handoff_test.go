@@ -100,6 +100,77 @@ func createAppliedGovernanceProposalForTest(t *testing.T, srv *Server, proposer,
 	return proposalID
 }
 
+func createGovernanceProposalWithDecisionTimesForTest(
+	t *testing.T,
+	srv *Server,
+	proposerUserID string,
+	title string,
+	closedAt time.Time,
+	appliedAt *time.Time,
+) int64 {
+	t.Helper()
+
+	content := fmt.Sprintf("Approved governance content for %s.", strings.TrimSpace(title))
+	proposal, _, err := srv.store.CreateKBProposal(t.Context(), store.KBProposal{
+		ProposerUserID:    proposerUserID,
+		Title:             strings.TrimSpace(title),
+		Reason:            "drive runtime follow-through",
+		Status:            "discussing",
+		VoteThresholdPct:  80,
+		VoteWindowSeconds: 3600,
+	}, store.KBProposalChange{
+		OpType:     "add",
+		Section:    "governance/runtime",
+		Title:      strings.TrimSpace(title),
+		NewContent: content,
+		DiffText:   "+ " + content,
+	})
+	if err != nil {
+		t.Fatalf("create governance proposal: %v", err)
+	}
+	seedProposalKnowledgeMetaForTest(t, srv, proposal.ID, proposerUserID, "governance", content, nil)
+	if _, err := srv.store.CloseKBProposal(t.Context(), proposal.ID, "approved", "ok", 1, 1, 0, 0, 1, closedAt.UTC()); err != nil {
+		t.Fatalf("close governance proposal: %v", err)
+	}
+	if appliedAt != nil {
+		if _, _, err := srv.store.ApplyKBProposal(t.Context(), proposal.ID, proposerUserID, appliedAt.UTC()); err != nil {
+			t.Fatalf("apply governance proposal: %v", err)
+		}
+	}
+	return proposal.ID
+}
+
+func createUpgradePRCollabForProposalSourceRefForTest(
+	t *testing.T,
+	srv *Server,
+	authorUserID string,
+	sourceRef string,
+) store.CollabSession {
+	t.Helper()
+
+	collabID := "upgrade-" + strings.ReplaceAll(strings.ReplaceAll(sourceRef, ":", "-"), "_", "-")
+	session, err := srv.store.CreateCollabSession(t.Context(), store.CollabSession{
+		CollabID:           collabID,
+		Title:              "Follow through " + sourceRef,
+		Goal:               "land approved governance change",
+		Kind:               "upgrade_pr",
+		Complexity:         "m",
+		Phase:              "reviewing",
+		ProposerUserID:     authorUserID,
+		AuthorUserID:       authorUserID,
+		OrchestratorUserID: authorUserID,
+		MinMembers:         1,
+		MaxMembers:         4,
+		PRURL:              "https://github.com/agi-bar/clawcolony/pull/123",
+		SourceRef:          sourceRef,
+		ImplementationMode: "code_change",
+	})
+	if err != nil {
+		t.Fatalf("create upgrade_pr collab: %v", err)
+	}
+	return session
+}
+
 func TestKBProposalGetReturnsUpgradeHandoffAndNotifications(t *testing.T) {
 	srv := newTestServer()
 	proposer := newAuthUser(t, srv)
@@ -280,5 +351,60 @@ func TestProposalImplementationStatusTracksLinkedUpgradeCollab(t *testing.T) {
 	}
 	if got := afterMergeBody["implementation_required"].(bool); got {
 		t.Fatalf("implementation_required should be false after merge: %s", afterMerge.Body.String())
+	}
+}
+
+func TestDuplicateGovernanceProposalSharesSiblingUpgradeState(t *testing.T) {
+	srv := newTestServer()
+	proposer := seedActiveUser(t, srv)
+	closedAt := time.Now().UTC().Add(-30 * time.Hour)
+	appliedOne := closedAt.Add(10 * time.Minute)
+	appliedTwo := closedAt.Add(20 * time.Minute)
+
+	firstProposalID := createGovernanceProposalWithDecisionTimesForTest(t, srv, proposer, "Token issuance rule", closedAt, &appliedOne)
+	secondProposalID := createGovernanceProposalWithDecisionTimesForTest(t, srv, proposer, "Token issuance rule", closedAt.Add(30*time.Minute), &appliedTwo)
+
+	sourceRef := fmt.Sprintf("kb_proposal:%d", firstProposalID)
+	collab := createUpgradePRCollabForProposalSourceRefForTest(t, srv, proposer, sourceRef)
+
+	detail := doJSONRequest(t, srv.mux, http.MethodGet, fmt.Sprintf("/api/v1/kb/proposals/get?proposal_id=%d", secondProposalID), nil)
+	if detail.Code != http.StatusOK {
+		t.Fatalf("proposal detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	detailBody := parseJSONBody(t, detail)
+	if got := strings.TrimSpace(detailBody["implementation_status"].(string)); got != "in_progress" {
+		t.Fatalf("implementation_status=%q want in_progress body=%s", got, detail.Body.String())
+	}
+	if got := strings.TrimSpace(detailBody["next_action"].(string)); got != "track existing upgrade-clawcolony work" {
+		t.Fatalf("next_action=%q want track existing upgrade-clawcolony work", got)
+	}
+	linked := detailBody["linked_upgrade"].(map[string]any)
+	if got := strings.TrimSpace(linked["collab_id"].(string)); got != collab.CollabID {
+		t.Fatalf("linked_upgrade collab_id=%q want %q", got, collab.CollabID)
+	}
+
+	mergedAt := time.Now().UTC()
+	if _, err := srv.store.UpdateCollabPR(t.Context(), store.CollabPRUpdate{
+		CollabID:         collab.CollabID,
+		GitHubPRState:    "merged",
+		PRMergeCommitSHA: "merge-same-topic-123",
+		PRMergedAt:       &mergedAt,
+	}); err != nil {
+		t.Fatalf("mark collab merged: %v", err)
+	}
+
+	afterMerge := doJSONRequest(t, srv.mux, http.MethodGet, fmt.Sprintf("/api/v1/governance/proposals/get?proposal_id=%d", secondProposalID), nil)
+	if afterMerge.Code != http.StatusOK {
+		t.Fatalf("governance detail after merge status=%d body=%s", afterMerge.Code, afterMerge.Body.String())
+	}
+	afterMergeBody := parseJSONBody(t, afterMerge)
+	if got := strings.TrimSpace(afterMergeBody["implementation_status"].(string)); got != "completed" {
+		t.Fatalf("implementation_status=%q want completed body=%s", got, afterMerge.Body.String())
+	}
+	if got := strings.TrimSpace(afterMergeBody["next_action"].(string)); got != "none" {
+		t.Fatalf("next_action=%q want none", got)
+	}
+	if got := afterMergeBody["implementation_required"].(bool); got {
+		t.Fatalf("implementation_required should be false after sibling merge: %s", afterMerge.Body.String())
 	}
 }

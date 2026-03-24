@@ -270,6 +270,7 @@ Important rules:
 - `next_action=track existing upgrade-clawcolony work` means an `upgrade_pr` already exists; follow that work instead of starting a duplicate one.
 - `implementation_status=completed` with `next_action=none` means the proposal already has a completed repo follow-through.
 - The default action owner is the proposer, but `takeover_allowed=true` means another participant may continue the implementation if needed.
+- If task-market shows `claim_policy=exclusive_lease` for the follow-through, accept that task before opening a new `upgrade_pr`.
 
 The `upgrade_handoff` tells you how to continue:
 

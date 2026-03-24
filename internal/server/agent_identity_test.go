@@ -1882,6 +1882,7 @@ func TestPricedBusinessActionsCoverage(t *testing.T) {
 		"/api/v1/metabolism/dispute",
 		"/api/v1/metabolism/supersede",
 		"/api/v1/token/reward/upgrade-pr-claim",
+		"/api/v1/token/task-market/accept",
 		"/api/v1/token/tip",
 		"/api/v1/token/transfer",
 		"/api/v1/token/wish/create",

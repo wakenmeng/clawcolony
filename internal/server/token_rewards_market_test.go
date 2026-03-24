@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -66,6 +68,33 @@ func setupUpgradePRRewardFlowForTest(t *testing.T, srv *Server, fixture *fakeUpg
 	applyUpgradePRReviewForTest(t, srv, reviewerOne, collab.CollabID, fixture.commentURL(2001))
 	applyUpgradePRReviewForTest(t, srv, reviewerTwo, collab.CollabID, fixture.commentURL(2002))
 	return collab
+}
+
+func proposalBundleTasksFromResponse(t *testing.T, w *httptest.ResponseRecorder) []map[string]any {
+	t.Helper()
+	body := parseJSONBody(t, w)
+	rawItems, _ := body["items"].([]any)
+	out := make([]map[string]any, 0)
+	for _, raw := range rawItems {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(fmt.Sprint(item["linked_resource_type"])) == "proposal_bundle" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func taskItemFromResponse(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	body := parseJSONBody(t, w)
+	item, ok := body["item"].(map[string]any)
+	if !ok {
+		t.Fatalf("response missing item body=%s", w.Body.String())
+	}
+	return item
 }
 
 func TestKBProposalApplyGrantsCommunityReward(t *testing.T) {
@@ -775,6 +804,7 @@ func TestTokenTaskMarketListsManualAndSystemItems(t *testing.T) {
 	for _, want := range []string{
 		`"source":"manual"`,
 		`"linked_resource_type":"bounty"`,
+		`"claim_policy":"shared_open"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("task market missing %s in %s", want, body)
@@ -790,6 +820,14 @@ func TestTokenTaskMarketListsManualAndSystemItems(t *testing.T) {
 	}
 	if strings.Contains(w.Body.String(), `"source":"system"`) {
 		t.Fatalf("system task market should respect status filter body=%s", w.Body.String())
+	}
+
+	w = doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?status=claimed&limit=20", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("task market claimed global filter status=%d body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"source":"manual"`) {
+		t.Fatalf("shared_open tasks should not appear in claimed market body=%s", w.Body.String())
 	}
 
 	w = doJSONRequestWithHeaders(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?source=system&module=collab&limit=20", nil, apiKeyHeaders(orchestratorAPIKey))
@@ -814,6 +852,7 @@ func TestTokenTaskMarketListsManualAndSystemItems(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), `"action_path":"/api/v1/token/reward/upgrade-pr-claim"`) ||
 		!strings.Contains(w.Body.String(), `"reward_rule_key":"upgrade-pr.reviewer"`) ||
+		!strings.Contains(w.Body.String(), `"claim_policy":"viewer_only"`) ||
 		!strings.Contains(w.Body.String(), `"linked_resource_id":"`+upgradeCollab.CollabID+`"`) {
 		t.Fatalf("upgrade reviewer should see claim task body=%s", w.Body.String())
 	}
@@ -823,6 +862,7 @@ func TestTokenTaskMarketListsManualAndSystemItems(t *testing.T) {
 		t.Fatalf("upgrade author task market status=%d body=%s", w.Code, w.Body.String())
 	}
 	if !strings.Contains(w.Body.String(), `"reward_rule_key":"upgrade-pr.author"`) ||
+		!strings.Contains(w.Body.String(), `"claim_policy":"viewer_only"`) ||
 		!strings.Contains(w.Body.String(), `"linked_resource_id":"`+upgradeCollab.CollabID+`"`) {
 		t.Fatalf("upgrade author should see claim task body=%s", w.Body.String())
 	}
@@ -882,6 +922,296 @@ func TestCollabCloseFailedDoesNotGrantCommunityReward(t *testing.T) {
 	}
 	if tokenBalanceForUser(t, srv, author) != 1000 {
 		t.Fatalf("failed collab close should not reward author body=%s", w.Body.String())
+	}
+}
+
+func TestGovernanceProposalTaskMarketGroupsSameTopicDuplicatesAfter24Hours(t *testing.T) {
+	srv := newTestServer()
+	proposer := seedActiveUser(t, srv)
+	oldClosedAt := time.Now().UTC().Add(-30 * time.Hour)
+	oldAppliedAt := oldClosedAt.Add(20 * time.Minute)
+
+	oldAppliedID := createGovernanceProposalWithDecisionTimesForTest(t, srv, proposer, "Token issuance rule", oldClosedAt, &oldAppliedAt)
+	oldApprovedID := createGovernanceProposalWithDecisionTimesForTest(t, srv, proposer, "Token issuance rule", oldClosedAt.Add(15*time.Minute), nil)
+	youngClosedAt := time.Now().UTC().Add(-2 * time.Hour)
+	youngAppliedAt := youngClosedAt.Add(20 * time.Minute)
+	youngID := createGovernanceProposalWithDecisionTimesForTest(t, srv, proposer, "Fresh governance topic", youngClosedAt, &youngAppliedAt)
+
+	w := doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?source=system&module=collab&limit=20", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("task market status=%d body=%s", w.Code, w.Body.String())
+	}
+	items := proposalBundleTasksFromResponse(t, w)
+	if len(items) != 1 {
+		t.Fatalf("expected exactly one proposal bundle task, got=%d body=%s", len(items), w.Body.String())
+	}
+	item := items[0]
+	if got := strings.TrimSpace(fmt.Sprint(item["reward_token"])); got != fmt.Sprintf("%d", communityRewardAmountUpgradeClosure) {
+		t.Fatalf("reward_token=%s want %d body=%s", got, communityRewardAmountUpgradeClosure, w.Body.String())
+	}
+	if got := strings.TrimSpace(fmt.Sprint(item["claim_policy"])); got != taskClaimPolicyExclusiveLease {
+		t.Fatalf("claim_policy=%q want %q body=%s", got, taskClaimPolicyExclusiveLease, w.Body.String())
+	}
+	if got := strings.TrimSpace(fmt.Sprint(item["community_reward_token"])); got != "0" {
+		t.Fatalf("community_reward_token=%s want 0 body=%s", got, w.Body.String())
+	}
+	if got := strings.TrimSpace(fmt.Sprint(item["reward_rule_key"])); got != "" {
+		t.Fatalf("reward_rule_key=%q want empty body=%s", got, w.Body.String())
+	}
+	if got := strings.TrimSpace(fmt.Sprint(item["action_path"])); got != "/upgrade-clawcolony.md" {
+		t.Fatalf("action_path=%q want /upgrade-clawcolony.md body=%s", got, w.Body.String())
+	}
+	proposalTask := item["proposal_task"].(map[string]any)
+	if got := strings.TrimSpace(fmt.Sprint(proposalTask["mode_policy"])); got != proposalTaskModePolicyAgentDecideFromHandoff {
+		t.Fatalf("mode_policy=%q want %q body=%s", got, proposalTaskModePolicyAgentDecideFromHandoff, w.Body.String())
+	}
+	if got := int64(proposalTask["primary_proposal_id"].(float64)); got != oldAppliedID {
+		t.Fatalf("primary_proposal_id=%d want %d body=%s", got, oldAppliedID, w.Body.String())
+	}
+	if got := proposalTask["merge_required"].(bool); !got {
+		t.Fatalf("merge_required should be true body=%s", w.Body.String())
+	}
+	proposalIDs := proposalTask["proposal_ids"].([]any)
+	if len(proposalIDs) != 2 {
+		t.Fatalf("proposal_ids length=%d want 2 body=%s", len(proposalIDs), w.Body.String())
+	}
+	gotIDs := []int64{int64(proposalIDs[0].(float64)), int64(proposalIDs[1].(float64))}
+	if gotIDs[0] != oldAppliedID || gotIDs[1] != oldApprovedID {
+		t.Fatalf("proposal_ids=%v want [%d %d] body=%s", gotIDs, oldAppliedID, oldApprovedID, w.Body.String())
+	}
+	sourceRefs := proposalTask["source_refs"].([]any)
+	if len(sourceRefs) != 2 {
+		t.Fatalf("source_refs length=%d want 2 body=%s", len(sourceRefs), w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), fmt.Sprintf(`"primary_proposal_id":%d`, youngID)) || strings.Contains(w.Body.String(), fmt.Sprintf(`"proposal_ids":[%d`, youngID)) {
+		t.Fatalf("young proposal should not appear in task market payload body=%s", w.Body.String())
+	}
+}
+
+func TestGovernanceProposalTaskMarketSkipsInProgressAndReentersAfterFailed(t *testing.T) {
+	srv := newTestServer()
+	proposer := seedActiveUser(t, srv)
+	oldClosedAt := time.Now().UTC().Add(-30 * time.Hour)
+	oldAppliedAt := oldClosedAt.Add(30 * time.Minute)
+
+	firstProposalID := createGovernanceProposalWithDecisionTimesForTest(t, srv, proposer, "Treasury issuance rule", oldClosedAt, &oldAppliedAt)
+	_ = createGovernanceProposalWithDecisionTimesForTest(t, srv, proposer, "Treasury issuance rule", oldClosedAt.Add(10*time.Minute), nil)
+
+	collab := createUpgradePRCollabForProposalSourceRefForTest(t, srv, proposer, fmt.Sprintf("kb_proposal:%d", firstProposalID))
+
+	w := doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?source=system&module=collab&limit=20", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("task market status=%d body=%s", w.Code, w.Body.String())
+	}
+	if items := proposalBundleTasksFromResponse(t, w); len(items) != 0 {
+		t.Fatalf("in-progress sibling should suppress proposal task body=%s", w.Body.String())
+	}
+
+	failedAt := time.Now().UTC()
+	if _, err := srv.store.UpdateCollabPhase(t.Context(), collab.CollabID, "failed", proposer, "needs a retry", &failedAt); err != nil {
+		t.Fatalf("mark collab failed: %v", err)
+	}
+	w = doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?source=system&module=collab&limit=20", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("task market after failed status=%d body=%s", w.Code, w.Body.String())
+	}
+	if items := proposalBundleTasksFromResponse(t, w); len(items) != 1 {
+		t.Fatalf("failed sibling should reopen proposal task body=%s", w.Body.String())
+	}
+
+	mergedAt := time.Now().UTC()
+	if _, err := srv.store.UpdateCollabPR(t.Context(), store.CollabPRUpdate{
+		CollabID:         collab.CollabID,
+		GitHubPRState:    "merged",
+		PRMergeCommitSHA: "merge-governance-task-123",
+		PRMergedAt:       &mergedAt,
+	}); err != nil {
+		t.Fatalf("mark collab merged: %v", err)
+	}
+	w = doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?source=system&module=collab&limit=20", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("task market after merged status=%d body=%s", w.Code, w.Body.String())
+	}
+	if items := proposalBundleTasksFromResponse(t, w); len(items) != 0 {
+		t.Fatalf("merged sibling should suppress proposal task body=%s", w.Body.String())
+	}
+}
+
+func TestProposalTaskAcceptClaimsAndReopensAfterExpiry(t *testing.T) {
+	srv := newTestServer()
+	proposer := seedActiveUser(t, srv)
+	claimer, claimerAPIKey := seedActiveUserWithAPIKey(t, srv)
+	_, otherAPIKey := seedActiveUserWithAPIKey(t, srv)
+	oldClosedAt := time.Now().UTC().Add(-30 * time.Hour)
+	oldAppliedAt := oldClosedAt.Add(15 * time.Minute)
+
+	_ = createGovernanceProposalWithDecisionTimesForTest(t, srv, proposer, "Leaseable governance topic", oldClosedAt, &oldAppliedAt)
+	_ = createGovernanceProposalWithDecisionTimesForTest(t, srv, proposer, "Leaseable governance topic", oldClosedAt.Add(10*time.Minute), nil)
+
+	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?source=system&module=collab&limit=20", nil, apiKeyHeaders(claimerAPIKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("task market status=%d body=%s", w.Code, w.Body.String())
+	}
+	items := proposalBundleTasksFromResponse(t, w)
+	if len(items) != 1 {
+		t.Fatalf("expected one open proposal task body=%s", w.Body.String())
+	}
+	taskID := strings.TrimSpace(fmt.Sprint(items[0]["task_id"]))
+
+	expiredClaimedAt := time.Now().UTC().Add(-7 * time.Hour)
+	expiredExpiresAt := expiredClaimedAt.Add(time.Hour)
+	if _, err := srv.store.ClaimTaskLease(t.Context(), store.TaskLease{
+		TaskKind:           proposalImplementationTaskLeaseKind,
+		TaskID:             taskID,
+		LinkedResourceType: "proposal_bundle",
+		LinkedResourceID:   strings.TrimPrefix(taskID, "proposal-implementation:"),
+		HolderUserID:       claimer,
+		ClaimedAt:          expiredClaimedAt,
+		ExpiresAt:          expiredExpiresAt,
+	}); err != nil {
+		t.Fatalf("seed expired lease: %v", err)
+	}
+	w = doJSONRequestWithHeaders(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?source=system&module=collab&limit=20", nil, apiKeyHeaders(claimerAPIKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("open market with expired lease status=%d body=%s", w.Code, w.Body.String())
+	}
+	if items := proposalBundleTasksFromResponse(t, w); len(items) != 1 {
+		t.Fatalf("expired lease should not hide proposal task body=%s", w.Body.String())
+	}
+	w = doJSONRequestWithHeaders(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?source=system&module=collab&status=claimed&limit=20", nil, apiKeyHeaders(claimerAPIKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("claimed market with expired lease status=%d body=%s", w.Code, w.Body.String())
+	}
+	if items := proposalBundleTasksFromResponse(t, w); len(items) != 0 {
+		t.Fatalf("expired lease should not appear in claimed market body=%s", w.Body.String())
+	}
+
+	accept := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/token/task-market/accept", map[string]any{
+		"task_id": taskID,
+	}, apiKeyHeaders(claimerAPIKey))
+	if accept.Code != http.StatusOK {
+		t.Fatalf("accept status=%d body=%s", accept.Code, accept.Body.String())
+	}
+	item := taskItemFromResponse(t, accept)
+	if got := strings.TrimSpace(fmt.Sprint(item["status"])); got != "claimed" {
+		t.Fatalf("accept status=%q want claimed body=%s", got, accept.Body.String())
+	}
+	if got := strings.TrimSpace(fmt.Sprint(item["assignee_user_id"])); got != claimer {
+		t.Fatalf("assignee_user_id=%q want %q body=%s", got, claimer, accept.Body.String())
+	}
+	if got := strings.TrimSpace(fmt.Sprint(item["claim_policy"])); got != taskClaimPolicyExclusiveLease {
+		t.Fatalf("claim_policy=%q want %q body=%s", got, taskClaimPolicyExclusiveLease, accept.Body.String())
+	}
+	if strings.TrimSpace(fmt.Sprint(item["lease_expires_at"])) == "" {
+		t.Fatalf("lease_expires_at missing body=%s", accept.Body.String())
+	}
+
+	w = doJSONRequestWithHeaders(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?source=system&module=collab&limit=20", nil, apiKeyHeaders(claimerAPIKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("open market after claim status=%d body=%s", w.Code, w.Body.String())
+	}
+	if items := proposalBundleTasksFromResponse(t, w); len(items) != 0 {
+		t.Fatalf("claimed proposal task should disappear from open market body=%s", w.Body.String())
+	}
+
+	w = doJSONRequestWithHeaders(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?source=system&module=collab&status=claimed&limit=20", nil, apiKeyHeaders(claimerAPIKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("claimed market status=%d body=%s", w.Code, w.Body.String())
+	}
+	if items := proposalBundleTasksFromResponse(t, w); len(items) != 1 {
+		t.Fatalf("claimer should see one claimed proposal task body=%s", w.Body.String())
+	}
+
+	w = doJSONRequestWithHeaders(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?source=system&module=collab&status=claimed&limit=20", nil, apiKeyHeaders(otherAPIKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("claimed market for outsider status=%d body=%s", w.Code, w.Body.String())
+	}
+	if items := proposalBundleTasksFromResponse(t, w); len(items) != 0 {
+		t.Fatalf("outsider should not see another user's claimed task body=%s", w.Body.String())
+	}
+
+	again := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/token/task-market/accept", map[string]any{
+		"task_id": taskID,
+	}, apiKeyHeaders(otherAPIKey))
+	if again.Code != http.StatusConflict {
+		t.Fatalf("second accept should conflict got=%d body=%s", again.Code, again.Body.String())
+	}
+
+	nonExclusive := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/token/task-market/accept", map[string]any{
+		"task_id": "bounty:1",
+	}, apiKeyHeaders(claimerAPIKey))
+	if nonExclusive.Code != http.StatusConflict {
+		t.Fatalf("non-exclusive task accept should conflict got=%d body=%s", nonExclusive.Code, nonExclusive.Body.String())
+	}
+}
+
+func TestProposalTaskAcceptGuardsUpgradePRPropose(t *testing.T) {
+	srv := newTestServer()
+	proposer := seedActiveUser(t, srv)
+	holder := newAuthUser(t, srv)
+	other := newAuthUser(t, srv)
+	oldClosedAt := time.Now().UTC().Add(-30 * time.Hour)
+	oldAppliedAt := oldClosedAt.Add(20 * time.Minute)
+	proposalID := createGovernanceProposalWithDecisionTimesForTest(t, srv, proposer, "Guarded governance implementation", oldClosedAt, &oldAppliedAt)
+
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 77)
+	fixture.pull = githubPullRequestRecord{
+		Number:  77,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Head.SHA = "head-sha-lease-guard"
+	fixture.pull.Head.Ref = "feature/lease-guard"
+	fixture.pull.Base.SHA = "base-sha-lease-guard"
+	fixture.pull.User.Login = "lease-holder"
+
+	payload := map[string]any{
+		"title":      "Governance follow-through",
+		"goal":       "Implement approved governance change",
+		"kind":       "upgrade_pr",
+		"pr_repo":    fixture.repo,
+		"pr_url":     fixture.pullURL(),
+		"source_ref": fmt.Sprintf("kb_proposal:%d", proposalID),
+	}
+
+	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/propose", payload, holder.headers())
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "accept the proposal task") {
+		t.Fatalf("missing lease should block propose got=%d body=%s", w.Code, w.Body.String())
+	}
+
+	market := doJSONRequestWithHeaders(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?source=system&module=collab&limit=20", nil, holder.headers())
+	if market.Code != http.StatusOK {
+		t.Fatalf("task market status=%d body=%s", market.Code, market.Body.String())
+	}
+	items := proposalBundleTasksFromResponse(t, market)
+	if len(items) != 1 {
+		t.Fatalf("expected one open proposal task body=%s", market.Body.String())
+	}
+	taskID := strings.TrimSpace(fmt.Sprint(items[0]["task_id"]))
+
+	accept := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/token/task-market/accept", map[string]any{
+		"task_id": taskID,
+	}, holder.headers())
+	if accept.Code != http.StatusOK {
+		t.Fatalf("accept status=%d body=%s", accept.Code, accept.Body.String())
+	}
+
+	w = doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/propose", payload, other.headers())
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "claimed by another user") {
+		t.Fatalf("non-holder should be blocked got=%d body=%s", w.Code, w.Body.String())
+	}
+
+	propose := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/propose", payload, holder.headers())
+	if propose.Code != http.StatusAccepted {
+		t.Fatalf("holder propose status=%d body=%s", propose.Code, propose.Body.String())
+	}
+
+	w = doJSONRequestWithHeaders(t, srv.mux, http.MethodGet, "/api/v1/token/task-market?source=system&module=collab&status=claimed&limit=20", nil, holder.headers())
+	if w.Code != http.StatusOK {
+		t.Fatalf("claimed market after propose status=%d body=%s", w.Code, w.Body.String())
+	}
+	if items := proposalBundleTasksFromResponse(t, w); len(items) != 0 {
+		t.Fatalf("proposal task should leave claimed market after follow-through starts body=%s", w.Body.String())
 	}
 }
 

@@ -183,6 +183,7 @@ var pricedBusinessActions = map[string]pricedBusinessAction{
 	"/api/v1/token/tip":                     {Path: "/api/v1/token/tip", ActorKey: "from_user_id", Tokens: 1, Label: "tip token"},
 	"/api/v1/token/wish/create":             {Path: "/api/v1/token/wish/create", ActorKey: "user_id", Tokens: 1, Label: "create wish"},
 	"/api/v1/token/wish/fulfill":            {Path: "/api/v1/token/wish/fulfill", ActorKey: "fulfilled_by", Tokens: 1, Label: "fulfill wish"},
+	"/api/v1/token/task-market/accept":      {Path: "/api/v1/token/task-market/accept", ActorKey: "user_id", Tokens: 1, Label: "accept proposal task"},
 	"/api/v1/token/reward/upgrade-pr-claim": {Path: "/api/v1/token/reward/upgrade-pr-claim", ActorKey: "user_id", Tokens: 1, Label: "claim upgrade_pr reward"},
 	"/api/v1/life/hibernate":                {Path: "/api/v1/life/hibernate", ActorKey: "user_id", Tokens: 1, Label: "hibernate"},
 	"/api/v1/life/wake":                     {Path: "/api/v1/life/wake", ActorKey: "waker_user_id", Tokens: 1, Label: "wake"},

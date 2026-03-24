@@ -32,6 +32,7 @@ type InMemoryStore struct {
 	archivedMessageIDs   map[int64]struct{}
 	archivedMailboxIDs   map[int64]struct{}
 	contacts             map[string]map[string]MailContact
+	taskLeases           map[string]TaskLease
 	collab               map[string]CollabSession
 	collabParts          []CollabParticipant
 	nextCollabPID        int64
@@ -101,6 +102,7 @@ func NewInMemory() *InMemoryStore {
 		archivedMessageIDs:   make(map[int64]struct{}),
 		archivedMailboxIDs:   make(map[int64]struct{}),
 		contacts:             make(map[string]map[string]MailContact),
+		taskLeases:           make(map[string]TaskLease),
 		collab:               make(map[string]CollabSession),
 		kbEntries:            make(map[int64]KBEntry),
 		kbProposals:          make(map[int64]KBProposal),
@@ -1401,6 +1403,86 @@ func (s *InMemoryStore) ListTokenLedger(_ context.Context, botID string, limit i
 		items = items[len(items)-limit:]
 	}
 	return items, nil
+}
+
+func taskLeaseMapKey(taskKind, taskID string) string {
+	return strings.TrimSpace(taskKind) + "|" + strings.TrimSpace(taskID)
+}
+
+func (s *InMemoryStore) ClaimTaskLease(_ context.Context, item TaskLease) (TaskLease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item.TaskKind = strings.TrimSpace(item.TaskKind)
+	item.TaskID = strings.TrimSpace(item.TaskID)
+	item.HolderUserID = strings.TrimSpace(item.HolderUserID)
+	if item.TaskKind == "" || item.TaskID == "" || item.HolderUserID == "" {
+		return TaskLease{}, fmt.Errorf("task_kind, task_id, and holder_user_id are required")
+	}
+	key := taskLeaseMapKey(item.TaskKind, item.TaskID)
+	if existing, ok := s.taskLeases[key]; ok && existing.ConsumedAt == nil && existing.ExpiresAt.After(item.ClaimedAt.UTC()) {
+		return TaskLease{}, ErrTaskLeaseConflict
+	}
+	item.ClaimedAt = item.ClaimedAt.UTC()
+	item.ExpiresAt = item.ExpiresAt.UTC()
+	s.taskLeases[key] = item
+	return item, nil
+}
+
+func (s *InMemoryStore) GetActiveTaskLease(_ context.Context, taskKind, taskID string, now time.Time) (TaskLease, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	it, ok := s.taskLeases[taskLeaseMapKey(taskKind, taskID)]
+	if !ok || it.ConsumedAt != nil || !it.ExpiresAt.After(now.UTC()) {
+		return TaskLease{}, false, nil
+	}
+	return it, true, nil
+}
+
+func (s *InMemoryStore) ListActiveTaskLeases(_ context.Context, taskKind, holderUserID string, now time.Time, limit int) ([]TaskLease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	taskKind = strings.TrimSpace(taskKind)
+	holderUserID = strings.TrimSpace(holderUserID)
+	if limit <= 0 {
+		limit = 100
+	}
+	out := make([]TaskLease, 0, len(s.taskLeases))
+	for _, it := range s.taskLeases {
+		if taskKind != "" && strings.TrimSpace(it.TaskKind) != taskKind {
+			continue
+		}
+		if holderUserID != "" && strings.TrimSpace(it.HolderUserID) != holderUserID {
+			continue
+		}
+		if it.ConsumedAt != nil || !it.ExpiresAt.After(now.UTC()) {
+			continue
+		}
+		out = append(out, it)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ClaimedAt.Equal(out[j].ClaimedAt) {
+			return out[i].TaskID < out[j].TaskID
+		}
+		return out[i].ClaimedAt.After(out[j].ClaimedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *InMemoryStore) ConsumeTaskLease(_ context.Context, taskKind, taskID, holderUserID string, consumedAt time.Time) (TaskLease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := taskLeaseMapKey(taskKind, taskID)
+	it, ok := s.taskLeases[key]
+	if !ok || it.ConsumedAt != nil || strings.TrimSpace(it.HolderUserID) != strings.TrimSpace(holderUserID) || !it.ExpiresAt.After(consumedAt.UTC()) {
+		return TaskLease{}, ErrTaskLeaseNotFound
+	}
+	at := consumedAt.UTC()
+	it.ConsumedAt = &at
+	s.taskLeases[key] = it
+	return it, nil
 }
 
 func (s *InMemoryStore) CreateCollabSession(_ context.Context, item CollabSession) (CollabSession, error) {

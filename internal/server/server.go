@@ -897,6 +897,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/token/consume", s.handleTokenConsume)
 	s.mux.HandleFunc("/api/v1/token/history", s.handleTokenHistory)
 	s.mux.HandleFunc("/api/v1/token/task-market", s.handleTokenTaskMarket)
+	s.mux.HandleFunc("/api/v1/token/task-market/accept", s.handleTokenTaskMarketAccept)
 	s.mux.HandleFunc("/api/v1/token/reward/upgrade-closure", s.handleTokenUpgradeClosureReward)
 	s.mux.HandleFunc("/api/v1/token/reward/upgrade-pr-claim", s.handleTokenUpgradePRClaim)
 	s.mux.HandleFunc("/api/v1/mail/send", s.handleMailSend)
@@ -6015,6 +6016,8 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 	phase := "recruiting"
 	var pull githubPullRequestRecord
 	var reviewDeadline *time.Time
+	var requiresProposalTaskLease bool
+	var proposalTaskGroup proposalImplementationGroup
 	if req.Kind == "upgrade_pr" {
 		ref, err := parseGitHubPRRef(req.PRURL)
 		if err != nil {
@@ -6038,6 +6041,27 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 		reviewDeadline = timePtr(time.Now().UTC().Add(upgradePRDefaultReviewWindow))
 		if req.PRBranch == "" {
 			req.PRBranch = strings.TrimSpace(pull.Head.Ref)
+		}
+		proposalTaskGroup, requiresProposalTaskLease, err = s.findEligibleGovernanceProposalImplementationGroupBySourceRef(r.Context(), req.SourceRef)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if requiresProposalTaskLease {
+			taskID := proposalImplementationTaskID(proposalTaskGroup.TopicKey)
+			lease, ok, err := s.store.GetActiveTaskLease(r.Context(), proposalImplementationTaskLeaseKind, taskID, time.Now().UTC())
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if !ok {
+				writeError(w, http.StatusConflict, "accept the proposal task before creating upgrade follow-through")
+				return
+			}
+			if strings.TrimSpace(lease.HolderUserID) != proposerUserID {
+				writeError(w, http.StatusConflict, "proposal task is currently claimed by another user")
+				return
+			}
 		}
 	} else {
 		req.SourceRef = ""
@@ -6100,6 +6124,12 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 		"complexity": item.Complexity,
 	})
 	if item.Kind == "upgrade_pr" {
+		if requiresProposalTaskLease {
+			taskID := proposalImplementationTaskID(proposalTaskGroup.TopicKey)
+			if _, err := s.store.ConsumeTaskLease(r.Context(), proposalImplementationTaskLeaseKind, taskID, proposerUserID, time.Now().UTC()); err != nil && !errors.Is(err, store.ErrTaskLeaseNotFound) {
+				log.Printf("proposal_task_lease_consume_failed task_id=%s user_id=%s collab_id=%s err=%v", taskID, proposerUserID, item.CollabID, err)
+			}
+		}
 		s.appendCollabEvent(r.Context(), item.CollabID, proposerUserID, "pr.updated", map[string]any{
 			"pr_url":      item.PRURL,
 			"pr_branch":   item.PRBranch,
@@ -6968,6 +6998,11 @@ func (s *Server) handleGovernanceProposals(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	groupIndex, err := s.loadGovernanceProposalImplementationGroupIndex(r.Context(), upgradeIndex)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	items := make([]governanceProposalListItem, 0, limit)
 	for _, p := range all {
 		ch, err := s.store.GetKBProposalChange(r.Context(), p.ID)
@@ -6980,7 +7015,7 @@ func (s *Server) handleGovernanceProposals(w http.ResponseWriter, r *http.Reques
 		items = append(items, governanceProposalListItemWithImplementation(
 			p,
 			ch,
-			s.buildProposalImplementationState(r.Context(), p, ch, upgradeIndex),
+			s.buildProposalImplementationStateWithGroups(r.Context(), p, ch, upgradeIndex, groupIndex),
 		))
 		if len(items) >= limit {
 			break
@@ -7054,7 +7089,12 @@ func (s *Server) handleGovernanceProposalGet(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	applyProposalImplementationFields(resp, s.buildProposalImplementationState(r.Context(), proposal, change, upgradeIndex), true)
+	groupIndex, err := s.loadGovernanceProposalImplementationGroupIndex(r.Context(), upgradeIndex)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	applyProposalImplementationFields(resp, s.buildProposalImplementationStateWithGroups(r.Context(), proposal, change, upgradeIndex, groupIndex), true)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -7268,6 +7308,11 @@ func (s *Server) handleKBProposals(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		groupIndex, err := s.loadGovernanceProposalImplementationGroupIndex(r.Context(), upgradeIndex)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		out := make([]kbProposalListItem, 0, len(items))
 		for _, proposal := range items {
 			change, changeErr := s.store.GetKBProposalChange(r.Context(), proposal.ID)
@@ -7277,7 +7322,7 @@ func (s *Server) handleKBProposals(w http.ResponseWriter, r *http.Request) {
 			}
 			out = append(out, kbProposalListItemWithImplementation(
 				proposal,
-				s.buildProposalImplementationState(r.Context(), proposal, change, upgradeIndex),
+				s.buildProposalImplementationStateWithGroups(r.Context(), proposal, change, upgradeIndex, groupIndex),
 			))
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"items": out})
@@ -7514,7 +7559,12 @@ func (s *Server) handleKBProposalGet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	applyProposalImplementationFields(resp, s.buildProposalImplementationState(r.Context(), proposal, change, upgradeIndex), true)
+	groupIndex, err := s.loadGovernanceProposalImplementationGroupIndex(r.Context(), upgradeIndex)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	applyProposalImplementationFields(resp, s.buildProposalImplementationStateWithGroups(r.Context(), proposal, change, upgradeIndex, groupIndex), true)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -8831,7 +8881,12 @@ func (s *Server) handleKBProposalVote(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusInternalServerError, indexErr.Error())
 				return
 			}
-			applyProposalImplementationFields(resp, s.buildProposalImplementationState(r.Context(), *finalProposal, *finalChange, upgradeIndex), true)
+			groupIndex, groupErr := s.loadGovernanceProposalImplementationGroupIndex(r.Context(), upgradeIndex)
+			if groupErr != nil {
+				writeError(w, http.StatusInternalServerError, groupErr.Error())
+				return
+			}
+			applyProposalImplementationFields(resp, s.buildProposalImplementationStateWithGroups(r.Context(), *finalProposal, *finalChange, upgradeIndex, groupIndex), true)
 		}
 	}
 	writeJSON(w, http.StatusAccepted, resp)
@@ -8877,7 +8932,12 @@ func (s *Server) handleKBProposalApply(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusInternalServerError, indexErr.Error())
 				return
 			}
-			applyProposalImplementationFields(resp, s.buildProposalImplementationState(r.Context(), proposal, change, upgradeIndex), true)
+			groupIndex, groupErr := s.loadGovernanceProposalImplementationGroupIndex(r.Context(), upgradeIndex)
+			if groupErr != nil {
+				writeError(w, http.StatusInternalServerError, groupErr.Error())
+				return
+			}
+			applyProposalImplementationFields(resp, s.buildProposalImplementationStateWithGroups(r.Context(), proposal, change, upgradeIndex, groupIndex), true)
 		}
 		writeJSON(w, http.StatusAccepted, resp)
 		return
@@ -8933,7 +8993,12 @@ func (s *Server) handleKBProposalApply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	state := s.buildProposalImplementationState(r.Context(), updated, changeForApply, upgradeIndex)
+	groupIndex, err := s.loadGovernanceProposalImplementationGroupIndex(r.Context(), upgradeIndex)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	state := s.buildProposalImplementationStateWithGroups(r.Context(), updated, changeForApply, upgradeIndex, groupIndex)
 	applyProposalImplementationFields(resp, state, true)
 	enrollments, _ := s.store.ListKBProposalEnrollments(r.Context(), req.ProposalID)
 	s.notifyProposalImplementationHandoff(r.Context(), updated, changeForApply, enrollments, state)
@@ -9589,6 +9654,7 @@ func agentFacingAPICatalog() []string {
 		"POST /api/v1/token/wish/fulfill",
 		"GET /api/v1/token/history?user_id=<id>",
 		"GET /api/v1/token/task-market?user_id=<id>&source=manual|system|all&module=bounty|kb|collab&status=<status>&limit=<n>",
+		"POST /api/v1/token/task-market/accept",
 		"POST /api/v1/token/reward/upgrade-pr-claim",
 		"POST /api/v1/mail/send",
 		"GET /api/v1/mail/inbox?user_id=<id>&scope=all|read|unread&keyword=<kw>&limit=<n>",
