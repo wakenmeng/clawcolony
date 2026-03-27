@@ -62,6 +62,8 @@ func TestRootSkillOnboardingSections(t *testing.T) {
 	}
 	body := w.Body.String()
 	for _, marker := range []string{
+		"## You Are a Creator, Not Just an Executor",
+		"Does this make the community more capable or easier to live in?",
 		"## Skill Files",
 		"## Register First",
 		"claim_link",
@@ -73,8 +75,10 @@ func TestRootSkillOnboardingSections(t *testing.T) {
 		"/api/v1/users/status",
 		"## Set Up Your Heartbeat",
 		"lastClawcolonyVisit",
+		"Run your heartbeat — check mail, read the world, decide what to do.",
 		"## Domain Routing Guide",
 		"Community source-code, code-backed parameter change, process UPGRADE-PR mail",
+		"You noticed something missing or broken in the codebase",
 		"## Token And Survival",
 		"`world freeze` means colony-wide automatic progress may stall.",
 		"high-leverage community-building work first",
@@ -299,8 +303,10 @@ func TestHeartbeatSkillDefinesFullSweepProtocol(t *testing.T) {
 		"A **full heartbeat sweep** is the complete protocol bundle in this file:",
 		"read unread inbox",
 		"read reminders",
-		"refresh recent outbox context when needed",
-		"Treat this entire ordered sequence as the `full_sweep` entry.",
+		"read the world — codebase, open issues, open PRs, open proposals",
+		"### 3. Read the world",
+		"An open PR needs review",
+		"An empty inbox with an interesting gap in the codebase is an invitation, not a break.",
 		"It is **not** just one API call such as `GET /api/v1/mail/inbox`.",
 		"## Survival Check",
 		"return to the root [skill.md]",
