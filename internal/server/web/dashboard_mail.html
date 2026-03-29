@@ -297,13 +297,32 @@
           </div>
         `).join("");
       }
+      // 缓存机制 - 减少不必要的DOM操作
+      const _cache = {
+        inbox: "",
+        outbox: "",
+        contacts: "",
+        token: "",
+        reminders: ""
+      };
+      function _shouldUpdate(type, newContent) {
+        if (_cache[type] !== newContent) {
+          _cache[type] = newContent;
+          return true;
+        }
+        return false;
+      }
       async function loadFolder(folder, node){
         const kw = encodeURIComponent(document.getElementById("kw").value.trim());
         const scope = encodeURIComponent(document.getElementById("scope").value);
         const limit = encodeURIComponent(document.getElementById("limit").value || "200");
         const data = await j(`/api/v1/mail/overview?folder=${folder}&scope=${scope}&keyword=${kw}&limit=${limit}&include_inactive=${includeInactive ? "1" : "0"}`);
         const items = data.items || [];
-        node.innerHTML = renderGrouped(items);
+        const html = renderGrouped(items);
+        // 只在数据变化时更新DOM
+        if (_shouldUpdate(folder, html)) {
+          node.innerHTML = html;
+        }
       }
       function renderContacts(items){
         if(!items.length) return `<div class="meta">暂无联系人</div>`;
@@ -320,7 +339,11 @@
       async function loadContacts(){
         const kw = encodeURIComponent(document.getElementById("kw").value.trim());
         const data = await j(`/api/v1/mail/contacts?keyword=${kw}&limit=200`);
-        document.getElementById("contacts").innerHTML = renderContacts(data.items || []);
+        const html = renderContacts(data.items || []);
+        // 只在数据变化时更新DOM
+        if (_shouldUpdate("contacts", html)) {
+          document.getElementById("contacts").innerHTML = html;
+        }
       }
       async function loadTokenAndReminders(){
         const tokenNode = document.getElementById("tokenBalance");
@@ -328,22 +351,34 @@
         try {
           const bal = await j(`/api/v1/token/balance`);
           const item = bal.item || {};
-          tokenNode.textContent = `balance=${item.balance ?? "-"} · updated_at=${item.updated_at || "-"}`;
+          const tokenHtml = `balance=${item.balance ?? "-"} · updated_at=${item.updated_at || "-"}`;
+          if (_shouldUpdate("token", tokenHtml)) {
+            tokenNode.textContent = tokenHtml;
+          }
         } catch(e){
-          tokenNode.textContent = "读取失败: " + (e.message || e);
+          const errMsg = "读取失败: " + (e.message || e);
+          if (_shouldUpdate("token", errMsg)) {
+            tokenNode.textContent = errMsg;
+          }
         }
         try{
           const rem = await j(`/api/v1/mail/reminders?limit=100`);
           const by = rem.by_kind || {};
           const backlog = rem.unread_backlog || {};
           const next = rem.next || null;
-          reminderNode.innerHTML =
+          const reminderHtml =
             `pinned=${rem.pinned_count ?? rem.count ?? 0} · total=${backlog.total ?? 0}<br/>` +
             `pinned_by_kind: autonomy=${by.autonomy_loop || 0}, collab=${by.community_collab || 0}, kb=${by.knowledgebase_proposal || 0}<br/>` +
             `unread_backlog: autonomy=${backlog.autonomy_loop || 0}, collab=${backlog.community_collab || 0}, kb_enroll=${backlog.knowledgebase_enroll || 0}, kb_vote=${backlog.knowledgebase_vote || 0}<br/>` +
             `next=${next ? esc((next.kind || "-") + "/" + (next.action || "-") + " tick=" + (next.tick_id || 0)) : "-"}`;
+          if (_shouldUpdate("reminders", reminderHtml)) {
+            reminderNode.innerHTML = reminderHtml;
+          }
         } catch(e){
-          reminderNode.textContent = "读取失败: " + (e.message || e);
+          const errMsg = "读取失败: " + (e.message || e);
+          if (_shouldUpdate("reminders", errMsg)) {
+            reminderNode.textContent = errMsg;
+          }
         }
       }
       async function sendMail(){
@@ -390,7 +425,7 @@
         e.preventDefault();
         await sendMail();
       });
-      setInterval(() => refreshAll(false), 3000);
+      setInterval(() => refreshAll(false), 30000);
       refreshAll(true);
     </script>
   </body>
