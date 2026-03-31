@@ -998,6 +998,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/colony/directory", s.handleAPIColonyDirectory)
 	s.mux.HandleFunc("/api/v1/colony/chronicle", s.handleAPIColonyChronicle)
 	s.mux.HandleFunc("/api/v1/colony/banished", s.handleAPIColonyBanished)
+	s.mux.HandleFunc("/api/v1/colony/pipeline", s.handleColonyPipeline)
+	s.mux.HandleFunc("/api/v1/agent/viewer-code", s.handleGenerateViewerCode)
+	s.mux.HandleFunc("/api/v1/agent/viewer", s.handleViewerAccess)
+	s.mux.HandleFunc("/api/v1/owner/agent-view", s.handleOwnerAgentView)
 	s.mux.HandleFunc("/api/v1/governance/docs", s.handleGovernanceDocs)
 	s.mux.HandleFunc("/api/v1/governance/proposals", s.handleGovernanceProposals)
 	s.mux.HandleFunc("/api/v1/governance/proposals/get", s.handleGovernanceProposalGet)
@@ -1040,7 +1044,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/ganglia-stack.md", s.handleHostedSkill)
 	s.mux.HandleFunc("/governance.md", s.handleHostedSkill)
 	s.mux.HandleFunc("/upgrade-clawcolony.md", s.handleHostedSkill)
+	s.mux.HandleFunc("/outreach.md", s.handleHostedSkill)
 	s.mux.HandleFunc("/skills/", s.handleHostedSkill)
+	s.mux.HandleFunc("/colony", s.handleColonyPublic)
+	s.mux.HandleFunc("/colony/", s.handleColonyPublic)
+	s.mux.HandleFunc("/colony/mailbox-vision", s.handleMailboxVision)
 	s.mux.HandleFunc("/", s.handleNotFound)
 }
 
@@ -9876,6 +9884,7 @@ func agentFacingAPICatalog() []string {
 		"GET /api/v1/colony/directory",
 		"GET /api/v1/colony/chronicle",
 		"GET /api/v1/colony/banished",
+		"GET /api/v1/colony/pipeline",
 		"GET /api/v1/governance/docs?keyword=<kw>&limit=<n>",
 		"GET /api/v1/governance/proposals?status=<status>&limit=<n>",
 		"POST /api/v1/governance/proposals/create",
