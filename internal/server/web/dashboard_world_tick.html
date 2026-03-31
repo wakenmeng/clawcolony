@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="zh-CN">
   <head>
+    <link rel="stylesheet" href="/dashboard/dashboard.css">
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Dashboard · World Tick</title>
@@ -54,8 +55,8 @@
         flex-wrap:wrap;
         padding:14px 18px;
         border-bottom:1px solid var(--line);
-        background:linear-gradient(180deg, rgba(11,25,44,.95) 0%, rgba(7,18,32,.9) 100%);
-        backdrop-filter: blur(8px);
+        /* backdrop-filter removed - causes scroll jank; use solid background instead */
+        background: linear-gradient(180deg, rgba(11,25,44,.98) 0%, rgba(7,18,32,.98) 100%);
         position:sticky;
         top:0;
         z-index:4;
@@ -70,7 +71,7 @@
         border-radius:999px;
         font-size:13px;
         letter-spacing:.02em;
-        transition:all .15s ease;
+        transition:color .15s ease,border-color .15s ease,background-color .15s ease,box-shadow .15s ease;
       }
       .tabs a:hover {
         color:var(--ink);
@@ -99,16 +100,19 @@
       button {
         border-color:rgba(89,148,196,.8);
         background:linear-gradient(180deg, rgba(26,77,118,.95) 0%, rgba(16,51,84,.95) 100%);
+        will-change:filter;
       }
-      button:hover { filter:brightness(1.08); }
+      button:hover { filter:brightness(1.08); transform:translateZ(0); }
       .panel, .card, .law, .cost, .evo {
         border-color:rgba(62,115,162,.78) !important;
         background:linear-gradient(180deg, rgba(17,38,62,.93) 0%, rgba(12,28,47,.92) 100%) !important;
         box-shadow:var(--shadow);
+        contain: layout style;
       }
       .item, .bot, .agent, .msg, .event {
         border-color:rgba(67,123,173,.72) !important;
         background:linear-gradient(180deg, rgba(17,38,62,.82) 0%, rgba(12,28,47,.82) 100%) !important;
+        contain: layout style;
       }
       pre, .log {
         background:rgba(6,16,29,.72);
@@ -212,11 +216,11 @@
       </div>
       <div class="panel" style="grid-column: 1 / -1;">
         <div class="title">World Unfreeze Rescue</div>
-        <div class="meta">按目标用户批量补 token，降低 at_risk 比例并解除世界冻结。</div>
+        <div class="meta">按目标用户批量补 token，降�?at_risk 比例并解除世界冻结�?/div>
         <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px;">
           <label>mode:
             <select id="freezeRescueMode">
-              <option value="at_risk">at_risk (自动选余额<=0用户)</option>
+              <option value="at_risk">at_risk (自动选余�?=0用户)</option>
               <option value="selected">selected (手动指定用户)</option>
             </select>
           </label>
@@ -228,7 +232,7 @@
           <span id="freezeRescueState" class="meta"></span>
         </div>
         <div style="margin-top:8px;">
-          <label style="display:block; margin-bottom:4px;">user_ids（仅 selected 模式生效，逗号/空格/换行分隔）:</label>
+          <label style="display:block; margin-bottom:4px;">user_ids（仅 selected 模式生效，逗号/空格/换行分隔�?</label>
           <textarea id="freezeRescueUserIDs" style="width:100%; min-height:80px;" placeholder="user-xxx&#10;user-yyy"></textarea>
         </div>
         <div id="freezeRescueResult" style="margin-top:8px;"></div>
@@ -354,7 +358,7 @@
       }
       function renderHistory(items){
         const node = document.getElementById("history");
-        // 限制只显示最近50条，避免过度渲染
+        // 限制只显示最�?0条，避免过度渲染
         const displayItems = items.slice(0, 50);
         if(!displayItems.length){ node.innerHTML = `<div class="item"><div class="meta">暂无历史</div></div>`; return; }
         node.innerHTML = displayItems.map(it => `
@@ -442,7 +446,7 @@
         const threshold = (d && d.threshold_amount) || 0;
         const items = (d && d.items) || [];
         if(!items.length){
-          node.innerHTML = `<div class="item"><div class="meta">无告警（threshold_amount=${esc(threshold)}）</div></div>`;
+          node.innerHTML = `<div class="item"><div class="meta">无告警（threshold_amount=${esc(threshold)}�?/div></div>`;
           return;
         }
         node.innerHTML = items.map(it => `
@@ -454,7 +458,7 @@
       function renderAlertNotifyLog(items){
         const node = document.getElementById("alertNotifyLog");
         if(!items.length){
-          node.innerHTML = `<div class="item"><div class="meta">暂无通知发送记录</div></div>`;
+          node.innerHTML = `<div class="item"><div class="meta">暂无通知发送记�?/div></div>`;
           return;
         }
         node.innerHTML = items.map(it => `
@@ -483,13 +487,13 @@
           ${row("collaboration","collaboration")}
           ${row("governance","governance")}
           ${row("knowledge","knowledge")}
-          ${alertRows || `<div class="item"><div class="meta">无进化告警</div></div>`}
+          ${alertRows || `<div class="item"><div class="meta">无进化告�?/div></div>`}
         `;
       }
       function renderEvolutionNotifyLog(items){
         const node = document.getElementById("evolutionNotifyLog");
         if(!items.length){
-          node.innerHTML = `<div class="item"><div class="meta">暂无通知发送记录</div></div>`;
+          node.innerHTML = `<div class="item"><div class="meta">暂无通知发送记�?/div></div>`;
           return;
         }
         node.innerHTML = items.map(it => `
@@ -502,7 +506,7 @@
       function renderLifeStates(items){
         const node = document.getElementById("lifeStates");
         if(!items.length){
-          node.innerHTML = `<div class="item"><div class="meta">暂无生命周期状态记录</div></div>`;
+          node.innerHTML = `<div class="item"><div class="meta">暂无生命周期状态记�?/div></div>`;
           return;
         }
         node.innerHTML = items.map(it => `
@@ -711,7 +715,15 @@
         await refreshAll();
       }
       bootstrap();
-      setInterval(refreshAll, 15000);
+      // Visibility-controlled polling: pause when tab is hidden, resume when visible
+      (function startVisibilityPolling(fn, interval) {
+        let timer;
+        function schedule() { timer = setTimeout(() => { fn(); schedule(); }, interval); }
+        function runNow() { fn(); schedule(); }
+        document.addEventListener("visibilitychange", () => { if (document.hidden) { clearTimeout(timer); } else { runNow(); } });
+        schedule();
+      })(refreshAll, 15000);
     </script>
+    <script src="/dashboard/dashboard.js" defer></script>
   </body>
 </html>

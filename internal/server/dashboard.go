@@ -8,7 +8,38 @@ import (
 )
 
 //go:embed web/*.html
+//go:embed web/*.css
+//go:embed web/*.js
 var dashboardFS embed.FS
+
+// longCacheHeaders sets aggressive caching for versioned static assets (CSS/JS).
+func longCacheHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "public, max-age=86400, stale-while-revalidate=3600")
+	w.Header().Set("CDN-Cache-Control", "public, max-age=86400")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "public, max-age=86400")
+}
+
+func (s *Server) handleDashboardAsset(w http.ResponseWriter, r *http.Request) {
+	// Serve CSS/JS with aggressive caching; HTML uses setStaticResourceCacheHeaders (no-cache).
+	file := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
+	if file != "dashboard.css" && file != "dashboard.js" {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := dashboardFS.ReadFile("web/" + file)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	longCacheHeaders(w)
+	if file == "dashboard.css" {
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	} else {
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	cleanPath := strings.Trim(path.Clean(r.URL.Path), "/")

@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="zh-CN">
   <head>
+    <link rel="stylesheet" href="/dashboard/dashboard.css">
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Dashboard · System Logs</title>
@@ -54,8 +55,8 @@
         flex-wrap:wrap;
         padding:14px 18px;
         border-bottom:1px solid var(--line);
-        background:linear-gradient(180deg, rgba(11,25,44,.95) 0%, rgba(7,18,32,.9) 100%);
-        backdrop-filter: blur(8px);
+        /* backdrop-filter removed - causes scroll jank; use solid background instead */
+        background: linear-gradient(180deg, rgba(11,25,44,.98) 0%, rgba(7,18,32,.98) 100%);
         position:sticky;
         top:0;
         z-index:4;
@@ -70,7 +71,7 @@
         border-radius:999px;
         font-size:13px;
         letter-spacing:.02em;
-        transition:all .15s ease;
+        transition:color .15s ease,border-color .15s ease,background-color .15s ease,box-shadow .15s ease;
       }
       .tabs a:hover {
         color:var(--ink);
@@ -99,16 +100,19 @@
       button {
         border-color:rgba(89,148,196,.8);
         background:linear-gradient(180deg, rgba(26,77,118,.95) 0%, rgba(16,51,84,.95) 100%);
+        will-change:filter;
       }
-      button:hover { filter:brightness(1.08); }
+      button:hover { filter:brightness(1.08); transform:translateZ(0); }
       .panel, .card, .law, .cost, .evo {
         border-color:rgba(62,115,162,.78) !important;
         background:linear-gradient(180deg, rgba(17,38,62,.93) 0%, rgba(12,28,47,.92) 100%) !important;
         box-shadow:var(--shadow);
+        contain: layout style;
       }
       .item, .bot, .agent, .msg, .event {
         border-color:rgba(67,123,173,.72) !important;
         background:linear-gradient(180deg, rgba(17,38,62,.82) 0%, rgba(12,28,47,.82) 100%) !important;
+        contain: layout style;
       }
       pre, .log {
         background:rgba(6,16,29,.72);
@@ -240,12 +244,20 @@
           document.getElementById("list").textContent = "读取失败: " + (e.message || e);
         }
       }
-      setInterval(refreshAll, 15000);
+      // Visibility-controlled polling: pause when tab is hidden, resume when visible
+      (function startVisibilityPolling(fn, interval) {
+        let timer;
+        function schedule() { timer = setTimeout(() => { fn(); schedule(); }, interval); }
+        function runNow() { fn(); schedule(); }
+        document.addEventListener("visibilitychange", () => { if (document.hidden) { clearTimeout(timer); } else { runNow(); } });
+        schedule();
+      })(refreshAll, 15000);
       document.getElementById("method").addEventListener("change", refreshAll);
       document.getElementById("user_id").addEventListener("change", refreshAll);
       loadUsers().then(refreshAll).catch(e => {
         document.getElementById("list").textContent = "读取失败: " + (e.message || e);
       });
     </script>
+    <script src="/dashboard/dashboard.js" defer></script>
   </body>
 </html>

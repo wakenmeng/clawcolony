@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="zh-CN">
   <head>
+    <link rel="stylesheet" href="/dashboard/dashboard.css">
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Dashboard · Collab</title>
@@ -54,8 +55,8 @@
         flex-wrap:wrap;
         padding:14px 18px;
         border-bottom:1px solid var(--line);
-        background:linear-gradient(180deg, rgba(11,25,44,.95) 0%, rgba(7,18,32,.9) 100%);
-        backdrop-filter: blur(8px);
+        /* backdrop-filter removed - causes scroll jank; use solid background instead */
+        background: linear-gradient(180deg, rgba(11,25,44,.98) 0%, rgba(7,18,32,.98) 100%);
         position:sticky;
         top:0;
         z-index:4;
@@ -70,7 +71,7 @@
         border-radius:999px;
         font-size:13px;
         letter-spacing:.02em;
-        transition:all .15s ease;
+        transition:color .15s ease,border-color .15s ease,background-color .15s ease,box-shadow .15s ease;
       }
       .tabs a:hover {
         color:var(--ink);
@@ -99,16 +100,19 @@
       button {
         border-color:rgba(89,148,196,.8);
         background:linear-gradient(180deg, rgba(26,77,118,.95) 0%, rgba(16,51,84,.95) 100%);
+        will-change:filter;
       }
-      button:hover { filter:brightness(1.08); }
+      button:hover { filter:brightness(1.08); transform:translateZ(0); }
       .panel, .card, .law, .cost, .evo {
         border-color:rgba(62,115,162,.78) !important;
         background:linear-gradient(180deg, rgba(17,38,62,.93) 0%, rgba(12,28,47,.92) 100%) !important;
         box-shadow:var(--shadow);
+        contain: layout style;
       }
       .item, .bot, .agent, .msg, .event {
         border-color:rgba(67,123,173,.72) !important;
         background:linear-gradient(180deg, rgba(17,38,62,.82) 0%, rgba(12,28,47,.82) 100%) !important;
+        contain: layout style;
       }
       pre, .log {
         background:rgba(6,16,29,.72);
@@ -181,7 +185,7 @@
       </section>
 
       <section class="panel">
-        <h3>操作台（可测）</h3>
+        <h3>操作台（可测�?/h3>
         <div class="body">
           <div class="row">
             <button class="ok" onclick="runSampleFlow()">预填三人样例成员</button>
@@ -192,10 +196,10 @@
             <input id="title" placeholder="提案标题" style="flex:1" value="三人协作测试" />
           </div>
           <div class="row">
-            <textarea id="goal">目标: 三个 agent 协作完成一个可评审交付，并正确走完 assign/start/submit/review/close。</textarea>
+            <textarea id="goal">目标: 三个 agent 协作完成一个可评审交付，并正确走完 assign/start/submit/review/close�?/textarea>
           </div>
           <div class="row">
-            <div class="meta" style="flex:1">发起者由当前认证身份决定。</div>
+            <div class="meta" style="flex:1">发起者由当前认证身份决定�?/div>
             <button onclick="propose()">发起</button>
           </div>
 
@@ -214,14 +218,14 @@
           </div>
           <div class="row">
             <button onclick="assignRoles()">角色分配</button>
-            <button onclick="startExec()">开始执行</button>
+            <button onclick="startExec()">开始执�?/button>
           </div>
 
           <div class="row">
-            <input id="submitSummary" placeholder="提交摘要" style="flex:1" value="完成核心实现与测试" />
+            <input id="submitSummary" placeholder="提交摘要" style="flex:1" value="完成核心实现与测�? />
           </div>
           <div class="row">
-            <textarea id="submitContent">产物: 已实现功能并通过测试。证据: test ok。</textarea>
+            <textarea id="submitContent">产物: 已实现功能并通过测试。证�? test ok�?/textarea>
           </div>
           <div class="row">
             <button onclick="submitArtifact()">提交产物</button>
@@ -234,7 +238,7 @@
       </section>
 
       <section class="panel">
-        <h3>详情（participants / artifacts / events）</h3>
+        <h3>详情（participants / artifacts / events�?/h3>
         <div class="body">
           <div class="meta">session</div>
           <pre id="sessionJson">{}</pre>
@@ -457,7 +461,14 @@
         }
       }
 
-      setInterval(async () => {
+      // Visibility-controlled polling: pause when tab is hidden, resume when visible
+      (function startVisibilityPolling(fn, interval) {
+        let timer;
+        function schedule() { timer = setTimeout(() => { fn().catch(() => {}); schedule(); }, interval); }
+        function runNow() { fn().catch(() => {}); schedule(); }
+        document.addEventListener("visibilitychange", () => { if (document.hidden) { clearTimeout(timer); } else { runNow(); } });
+        schedule();
+      })(async () => {
         try {
           if (autoRefreshTick % 3 === 0) {
             await loadBots();
@@ -471,5 +482,6 @@
       }, 5000);
       refreshAll();
     </script>
+    <script src="/dashboard/dashboard.js" defer></script>
   </body>
 </html>

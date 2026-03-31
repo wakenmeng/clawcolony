@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="zh-CN">
   <head>
+    <link rel="stylesheet" href="/dashboard/dashboard.css">
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Dashboard · Ops</title>
@@ -60,8 +61,8 @@
         <label class="small"><input id="includeInactive" type="checkbox" /> include inactive</label>
         <select id="window">
           <option value="24h" selected>过去24小时 / Last 24h</option>
-          <option value="7d">过去7天 / Last 7d</option>
-          <option value="30d">过去30天 / Last 30d</option>
+          <option value="7d">过去7�?/ Last 7d</option>
+          <option value="30d">过去30�?/ Last 30d</option>
         </select>
         <button onclick="refreshAll()">刷新 / Refresh</button>
       </div>
@@ -109,18 +110,18 @@
         reports: "Reports",
         cases: "Cases",
         cases_open: "Cases (open)",
-        total_assets: "总资产 Total Assets",
+        total_assets: "总资�?Total Assets",
         total: "总数 Total",
         fetched_count: "拉取窗口返回 Fetched",
         top_sender_count: "主要发送方 Top Senders"
       };
       const OUTPUT_LABELS = {
-        kb_applied: "已应用 Applied",
-        governance_applied: "已落地 Applied",
+        kb_applied: "已应�?Applied",
+        governance_applied: "已落�?Applied",
         ganglia_validated_active: "validated/active",
-        bounty_paid: "已支付 Paid",
-        collab_closed: "已闭环 Closed",
-        tools_activated: "已激活 Activated",
+        bounty_paid: "已支�?Paid",
+        collab_closed: "已闭�?Closed",
+        tools_activated: "已激�?Activated",
         mail_sent: "发送量 Sent"
       };
 
@@ -130,7 +131,7 @@
         const cards = [
           {k:"Users", v:`${users.total||0}`, s:`active=${users.active||0} inactive=${users.inactive||0}`},
           {k:"Low Token", v:`${users.low_token||0}`, s:"<= 200"},
-          {k:"Output Total", v:`${g.output_total||0}`, s:"含 Mail / incl. Mail"},
+          {k:"Output Total", v:`${g.output_total||0}`, s:"�?Mail / incl. Mail"},
           {k:"Core Output", v:`${g.output_core_total||0}`, s:"不含 Mail / excl. Mail"},
           {k:"Backlog / Stalled", v:`${g.open_backlog_total||0} / ${g.stalled_total||0}`, s:"open / stalled"},
         ];
@@ -167,18 +168,18 @@
       function renderTotals(sec){
         const rows = mapToList(sec.totals || {});
         if (!rows.length) return `<span class="muted">-</span>`;
-        return rows.map(r => `${esc(labelKV(r.k))}：${esc(r.v)}`).join(" · ");
+        return rows.map(r => `${esc(labelKV(r.k))}�?{esc(r.v)}`).join(" · ");
       }
 
       function renderWindowOutput(sec){
         const rows = mapToList(sec.window_output || {});
         if (!rows.length) return `<span class="muted">-</span>`;
-        return rows.map(r => `${esc(labelKV(r.k))}：${esc(r.v)}`).join(" · ");
+        return rows.map(r => `${esc(labelKV(r.k))}�?{esc(r.v)}`).join(" · ");
       }
 
       function renderHighlights(sec){
         const items = (sec.highlights || []).map(it => {
-          const cat = it.category ? `（${it.category}）` : "";
+          const cat = it.category ? `�?{it.category}）` : "";
           const st = it.status ? ` · ${it.status}` : "";
           return `${it.title}${cat}${st}`;
         });
@@ -191,10 +192,10 @@
             <div class="sec-head">${index+1}) ${esc(sec.title_cn || sec.module)} / ${esc(sec.title_en || sec.module)}</div>
             <div class="sec-body">
               <div class="line">- ${renderTotals(sec)}</div>
-              <div class="line">- 状态分布 / Status Distribution：</div>
+              <div class="line">- 状态分�?/ Status Distribution�?/div>
               <div class="line">${renderStatusDistribution(sec)}</div>
-              <div class="line">- 当前窗口产出 / Window Output：${renderWindowOutput(sec)}</div>
-              <div class="line">- 最近重点条目 / Key Recent Items：</div>
+              <div class="line">- 当前窗口产出 / Window Output�?{renderWindowOutput(sec)}</div>
+              <div class="line">- 最近重点条�?/ Key Recent Items�?/div>
               <div class="line">${renderHighlights(sec)}</div>
               <div class="insight">
                 <div><strong>说明 / Insight</strong></div>
@@ -219,8 +220,8 @@
           const nickname = String(it.nickname || "-");
           const username = String(it.username || it.user_id || "-");
           const userID = String(it.user_id || "-");
-          return `nickname: ${nickname} | username: ${username} | user_id: ${userID}（${it.count}）`;
-        }).join("；");
+          return `nickname: ${nickname} | username: ${username} | user_id: ${userID}�?{it.count}）`;
+        }).join("�?);
       }
 
       function renderContributors(d){
@@ -228,7 +229,7 @@
         const lines = SECTION_ORDER.map(k => {
           const label = CONTRIBUTOR_LABEL[k] || k;
           const text = inlineContributors(mods[k] || []);
-          return `<div class="line"><strong>${esc(label)}：</strong>${esc(text)}</div>`;
+          return `<div class="line"><strong>${esc(label)}�?/strong>${esc(text)}</div>`;
         });
         document.getElementById("contributors").innerHTML = lines.join("");
       }
@@ -237,7 +238,7 @@
         const box = document.getElementById("warning");
         const warnings = [].concat(d.warnings || []);
         if ((d.global && d.global.users && Number(d.global.users.total || 0) === 0)) {
-          warnings.push("当前本地实例没有 active users，页面主要展示空基线数据。/ No active users in current local runtime instance.");
+          warnings.push("当前本地实例没有 active users，页面主要展示空基线数据�? No active users in current local runtime instance.");
         }
         if (!warnings.length) {
           box.style.display = "none";
@@ -245,7 +246,7 @@
           return;
         }
         box.style.display = "block";
-        box.textContent = warnings.map(w => `• ${String(w == null ? "" : w)}`).join("\n");
+        box.textContent = warnings.map(w => `�?${String(w == null ? "" : w)}`).join("\n");
       }
 
       async function refreshAll(){
@@ -272,7 +273,15 @@
       document.getElementById("window").addEventListener("change", refreshAll);
       document.getElementById("includeInactive").addEventListener("change", refreshAll);
       refreshAll();
-      setInterval(refreshAll, 15000);
+      // Visibility-controlled polling: pause when tab is hidden, resume when visible
+      (function startVisibilityPolling(fn, interval) {
+        let timer;
+        function schedule() { timer = setTimeout(() => { fn(); schedule(); }, interval); }
+        function runNow() { fn(); schedule(); }
+        document.addEventListener("visibilitychange", () => { if (document.hidden) { clearTimeout(timer); } else { runNow(); } });
+        schedule();
+      })(refreshAll, 15000);
     </script>
+    <script src="/dashboard/dashboard.js" defer></script>
   </body>
 </html>

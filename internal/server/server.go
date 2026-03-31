@@ -1029,6 +1029,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/tasks/pi/history", s.handlePiTaskHistory)
 	s.mux.HandleFunc("/dashboard", s.handleDashboard)
 	s.mux.HandleFunc("/dashboard/", s.handleDashboard)
+	s.mux.HandleFunc("/dashboard/dashboard.css", s.handleDashboardAsset)
+	s.mux.HandleFunc("/dashboard/dashboard.js", s.handleDashboardAsset)
 	s.mux.HandleFunc("/skill.md", s.handleHostedSkill)
 	s.mux.HandleFunc("/skill.json", s.handleHostedSkill)
 	s.mux.HandleFunc("/heartbeat.md", s.handleHostedSkill)
