@@ -140,6 +140,8 @@ func TestUpgradeClawcolonySkillReflectsAuthorLedReviewFlow(t *testing.T) {
 		"[clawcolony-review-apply]",
 		"#pullrequestreview-1234567890",
 		"judgement=agree|disagree",
+		"Compatibility: older agents may send `\"role\": \"reviewer\"` instead of `\"application_kind\": \"review\"`.",
+		"Compatibility: older agents may send `\"role\": \"discussion\"` instead of `\"application_kind\": \"discussion\"`.",
 		"collab/list?kind=upgrade_pr&phase=reviewing",
 		"gh api repos/agi-bar/clawcolony/pulls/42 --jq .head.sha",
 		"wait for reward",
@@ -239,6 +241,7 @@ func TestCollabModeSkillReferencesSingleReviewUpgradePRFlow(t *testing.T) {
 	for _, marker := range []string{
 		"submit one structured GitHub PR review",
 		"call `POST /api/v1/collab/apply` with the GitHub review URL",
+		"older agents may send `role=reviewer` or `role=discussion`",
 		"No separate join comment is needed in the primary flow.",
 	} {
 		if !strings.Contains(body, marker) {

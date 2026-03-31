@@ -3899,6 +3899,7 @@ type collabApplyRequest struct {
 	CollabID        string `json:"collab_id"`
 	Pitch           string `json:"pitch"`
 	ApplicationKind string `json:"application_kind"`
+	Role            string `json:"role"`
 	EvidenceURL     string `json:"evidence_url"`
 }
 
@@ -6255,6 +6256,7 @@ func (s *Server) handleCollabApply(w http.ResponseWriter, r *http.Request) {
 	req.CollabID = strings.TrimSpace(req.CollabID)
 	req.Pitch = strings.TrimSpace(req.Pitch)
 	req.ApplicationKind = strings.TrimSpace(strings.ToLower(req.ApplicationKind))
+	req.Role = strings.TrimSpace(strings.ToLower(req.Role))
 	req.EvidenceURL = strings.TrimSpace(req.EvidenceURL)
 	if req.CollabID == "" {
 		writeError(w, http.StatusBadRequest, "collab_id is required")
@@ -6271,8 +6273,10 @@ func (s *Server) handleCollabApply(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "collab is already closed")
 			return
 		}
-		if req.ApplicationKind == "" {
-			req.ApplicationKind = "discussion"
+		req.ApplicationKind, err = normalizeUpgradePRApplyKind(req.ApplicationKind, req.Role)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
 		}
 		switch req.ApplicationKind {
 		case "review":
@@ -6323,6 +6327,35 @@ func (s *Server) handleCollabApply(w http.ResponseWriter, r *http.Request) {
 	})
 	s.notifyCollabApply(r.Context(), session, userID)
 	writeJSON(w, http.StatusAccepted, map[string]any{"item": item})
+}
+
+func normalizeUpgradePRApplyKind(applicationKind, role string) (string, error) {
+	applicationKind = strings.TrimSpace(strings.ToLower(applicationKind))
+	role = strings.TrimSpace(strings.ToLower(role))
+	if applicationKind == "" {
+		switch role {
+		case "", "discussion":
+			return "discussion", nil
+		case "review", "reviewer":
+			return "review", nil
+		default:
+			return "", fmt.Errorf("role must be reviewer or discussion when application_kind is omitted")
+		}
+	}
+	switch applicationKind {
+	case "review":
+		if role != "" && role != "review" && role != "reviewer" {
+			return "", fmt.Errorf("role conflicts with application_kind=review")
+		}
+		return "review", nil
+	case "discussion":
+		if role != "" && role != "discussion" {
+			return "", fmt.Errorf("role conflicts with application_kind=discussion")
+		}
+		return "discussion", nil
+	default:
+		return "", fmt.Errorf("application_kind must be review or discussion")
+	}
 }
 
 func (s *Server) notifyCollabApply(ctx context.Context, session store.CollabSession, applicantUserID string) {

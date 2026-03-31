@@ -317,6 +317,87 @@ func TestCollabUpgradePRAuthorLedUpdateAndApplyFlow(t *testing.T) {
 	}
 }
 
+func TestCollabUpgradePRApplyAcceptsRoleCompatibility(t *testing.T) {
+	srv := newTestServer()
+	proposer := newAuthUser(t, srv)
+	reviewer := newAuthUser(t, srv)
+	discussionUser := newAuthUser(t, srv)
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: proposer.id, GitHubUsername: "author-login"}); err != nil {
+		t.Fatalf("upsert proposer github username: %v", err)
+	}
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: reviewer.id, GitHubUsername: "reviewer-one"}); err != nil {
+		t.Fatalf("upsert reviewer github username: %v", err)
+	}
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 58)
+	fixture.pull = githubPullRequestRecord{
+		Number:  58,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Head.SHA = "head-sha-compat-5858585"
+	fixture.pull.Head.Ref = "feature/review-role-compat"
+	fixture.pull.Base.SHA = "base-sha-compat-1111111"
+	fixture.pull.User.Login = "author-login"
+
+	upgrade := proposeCollabForTest(t, srv, proposer, map[string]any{
+		"title":   "Review apply role compatibility",
+		"goal":    "Keep legacy role-based apply payloads working",
+		"kind":    "upgrade_pr",
+		"pr_repo": "agi-bar/clawcolony",
+		"pr_url":  fixture.pullURL(),
+	})
+
+	fixture.reviews = []githubPullReviewRecord{
+		makeUpgradePRAppliedReview(9001, "reviewer-one", reviewer.id, "APPROVED", upgrade.CollabID, fixture.pull.Head.SHA, "agree", "looks good", "none", time.Now().Add(-1*time.Minute)),
+	}
+
+	reviewApply := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/apply", map[string]any{
+		"collab_id":    upgrade.CollabID,
+		"role":         "reviewer",
+		"evidence_url": fixture.reviewURL(9001),
+	}, reviewer.headers())
+	if reviewApply.Code != http.StatusAccepted {
+		t.Fatalf("review role-compat apply status=%d body=%s", reviewApply.Code, reviewApply.Body.String())
+	}
+	var reviewResp struct {
+		Item store.CollabParticipant `json:"item"`
+	}
+	if err := json.Unmarshal(reviewApply.Body.Bytes(), &reviewResp); err != nil {
+		t.Fatalf("decode review role-compat response: %v", err)
+	}
+	if !reviewResp.Item.Verified || reviewResp.Item.ApplicationKind != "review" || reviewResp.Item.Role != "reviewer" {
+		t.Fatalf("review role-compat apply mismatch: %+v", reviewResp.Item)
+	}
+
+	discussionApply := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/apply", map[string]any{
+		"collab_id": upgrade.CollabID,
+		"role":      "discussion",
+		"pitch":     "I have comments but no formal review.",
+	}, discussionUser.headers())
+	if discussionApply.Code != http.StatusAccepted {
+		t.Fatalf("discussion role-compat apply status=%d body=%s", discussionApply.Code, discussionApply.Body.String())
+	}
+	var discussionResp struct {
+		Item store.CollabParticipant `json:"item"`
+	}
+	if err := json.Unmarshal(discussionApply.Body.Bytes(), &discussionResp); err != nil {
+		t.Fatalf("decode discussion role-compat response: %v", err)
+	}
+	if discussionResp.Item.ApplicationKind != "discussion" || discussionResp.Item.Role != "discussion" || discussionResp.Item.Verified {
+		t.Fatalf("discussion role-compat apply mismatch: %+v", discussionResp.Item)
+	}
+
+	conflict := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/apply", map[string]any{
+		"collab_id":        upgrade.CollabID,
+		"application_kind": "review",
+		"role":             "discussion",
+		"evidence_url":     fixture.reviewURL(9001),
+	}, reviewer.headers())
+	if conflict.Code != http.StatusBadRequest || !strings.Contains(conflict.Body.String(), "role conflicts with application_kind=review") {
+		t.Fatalf("conflicting role/application_kind should fail, got=%d body=%s", conflict.Code, conflict.Body.String())
+	}
+}
+
 func TestCollabUpgradePRMergeGateUsesGitHubReviewsAndStaleHeads(t *testing.T) {
 	srv := newTestServer()
 	author := newAuthUser(t, srv)
