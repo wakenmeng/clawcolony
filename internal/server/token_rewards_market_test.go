@@ -460,6 +460,78 @@ func TestUpgradePRClosedWithoutMergeRewardsReviewersOnly(t *testing.T) {
 	}
 }
 
+func TestUpgradePRMergedSyncRewardsAutoSyncedReviewers(t *testing.T) {
+	srv := newTestServer()
+	ctx := context.Background()
+	author := newAuthUser(t, srv)
+	reviewerOne := newAuthUser(t, srv)
+	reviewerTwo := newAuthUser(t, srv)
+	if _, err := srv.store.UpsertAgentProfile(ctx, store.AgentProfile{UserID: author.id, GitHubUsername: "author-login"}); err != nil {
+		t.Fatalf("upsert author github username: %v", err)
+	}
+	if _, err := srv.store.UpsertAgentProfile(ctx, store.AgentProfile{UserID: reviewerOne.id, GitHubUsername: "reviewer-one"}); err != nil {
+		t.Fatalf("upsert reviewer one github username: %v", err)
+	}
+	if _, err := srv.store.UpsertAgentProfile(ctx, store.AgentProfile{UserID: reviewerTwo.id, GitHubUsername: "reviewer-two"}); err != nil {
+		t.Fatalf("upsert reviewer two github username: %v", err)
+	}
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 94)
+	fixture.pull = githubPullRequestRecord{
+		Number:  94,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Head.SHA = "sha-head-auto-merged"
+	fixture.pull.Base.SHA = "sha-base-auto-merged"
+	fixture.pull.User.Login = "author-login"
+
+	collab := proposeCollabForTest(t, srv, author, map[string]any{
+		"title":   "Rewarded auto-synced upgrade PR",
+		"goal":    "Ensure reviewer rewards survive when apply is forgotten",
+		"kind":    "upgrade_pr",
+		"pr_repo": fixture.repo,
+		"pr_url":  fixture.pullURL(),
+	})
+	collab = updateUpgradePRForTest(t, srv, author, map[string]any{
+		"collab_id": collab.CollabID,
+		"pr_branch": "feature/auto-synced-upgrade",
+	})
+	fixture.reviews = []githubPullReviewRecord{
+		makeUpgradePRAppliedReview(9401, "reviewer-one", reviewerOne.id, "APPROVED", collab.CollabID, fixture.pull.Head.SHA, "agree", "ship it", "none", time.Now().Add(-5*time.Minute)),
+		makeUpgradePRAppliedReview(9402, "reviewer-two", reviewerTwo.id, "COMMENTED", collab.CollabID, fixture.pull.Head.SHA, "disagree", "one concern", "key issue", time.Now().Add(-4*time.Minute)),
+	}
+	mergedAt := time.Now().UTC()
+	fixture.pull.State = "closed"
+	fixture.pull.Merged = true
+	fixture.pull.MergeCommitSHA = "merge-commit-auto-123"
+	fixture.pull.MergedAt = &mergedAt
+
+	session, err := srv.store.GetCollabSession(ctx, collab.CollabID)
+	if err != nil {
+		t.Fatalf("reload collab before sync: %v", err)
+	}
+	if err := srv.syncUpgradePRState(ctx, session); err != nil {
+		t.Fatalf("sync merged auto-synced upgrade_pr: %v", err)
+	}
+
+	after, err := srv.store.GetCollabSession(ctx, collab.CollabID)
+	if err != nil {
+		t.Fatalf("reload collab after sync: %v", err)
+	}
+	if after.Phase != "closed" || after.GitHubPRState != "merged" {
+		t.Fatalf("merged upgrade_pr should auto-close, got=%+v", after)
+	}
+	if got := tokenBalanceForUser(t, srv, author.id); got != 1000+communityRewardAmountUpgradePRAuthor {
+		t.Fatalf("author merged reward mismatch balance=%d", got)
+	}
+	if got := tokenBalanceForUser(t, srv, reviewerOne.id); got != 1000+communityRewardAmountUpgradePRReviewer {
+		t.Fatalf("reviewer one auto-synced reward mismatch balance=%d", got)
+	}
+	if got := tokenBalanceForUser(t, srv, reviewerTwo.id); got != 1000+communityRewardAmountUpgradePRReviewer {
+		t.Fatalf("reviewer two auto-synced reward mismatch balance=%d", got)
+	}
+}
+
 func TestUpgradePRClaimReturnsFallbackRewardForEligibleUser(t *testing.T) {
 	srv := newTestServer()
 	author := newAuthUser(t, srv)

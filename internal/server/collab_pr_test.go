@@ -398,6 +398,99 @@ func TestCollabUpgradePRApplyAcceptsRoleCompatibility(t *testing.T) {
 	}
 }
 
+func TestSyncUpgradePRStateAutoRegistersStructuredGitHubReviews(t *testing.T) {
+	srv := newTestServer()
+	author := newAuthUser(t, srv)
+	reviewer := newAuthUser(t, srv)
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: author.id, GitHubUsername: "author-login"}); err != nil {
+		t.Fatalf("upsert author github username: %v", err)
+	}
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: reviewer.id, GitHubUsername: "reviewer-one"}); err != nil {
+		t.Fatalf("upsert reviewer github username: %v", err)
+	}
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 73)
+	fixture.pull = githubPullRequestRecord{
+		Number:  73,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Base.SHA = "sha-base-7373737"
+	fixture.pull.Head.SHA = "sha-head-7373737"
+	fixture.pull.Head.Ref = "feature/auto-register-reviewers"
+	fixture.pull.User.Login = "author-login"
+
+	upgrade := proposeCollabForTest(t, srv, author, map[string]any{
+		"title":   "Auto-register reviewers",
+		"goal":    "Pull GitHub review bodies into collab reviewers automatically",
+		"kind":    "upgrade_pr",
+		"pr_repo": "agi-bar/clawcolony",
+		"pr_url":  fixture.pullURL(),
+	})
+	fixture.reviews = []githubPullReviewRecord{
+		makeUpgradePRAppliedReview(7301, "reviewer-one", reviewer.id, "APPROVED", upgrade.CollabID, fixture.pull.Head.SHA, "agree", "ready to merge", "none", time.Now().Add(-2*time.Minute)),
+	}
+
+	beforeParts, err := srv.store.ListCollabParticipants(t.Context(), upgrade.CollabID, "", 20)
+	if err != nil {
+		t.Fatalf("list participants before sync: %v", err)
+	}
+	if len(beforeParts) != 1 || beforeParts[0].Role != "author" {
+		t.Fatalf("expected only author before sync, got=%+v", beforeParts)
+	}
+
+	session, err := srv.store.GetCollabSession(t.Context(), upgrade.CollabID)
+	if err != nil {
+		t.Fatalf("reload collab before sync: %v", err)
+	}
+	if err := srv.syncUpgradePRState(t.Context(), session); err != nil {
+		t.Fatalf("sync upgrade_pr state: %v", err)
+	}
+
+	afterParts, err := srv.store.ListCollabParticipants(t.Context(), upgrade.CollabID, "", 20)
+	if err != nil {
+		t.Fatalf("list participants after sync: %v", err)
+	}
+	if len(afterParts) != 2 {
+		t.Fatalf("expected author plus auto-synced reviewer, got=%+v", afterParts)
+	}
+	var autoReviewer store.CollabParticipant
+	for _, p := range afterParts {
+		if p.UserID == reviewer.id {
+			autoReviewer = p
+			break
+		}
+	}
+	if autoReviewer.UserID == "" {
+		t.Fatalf("auto-synced reviewer missing from participants: %+v", afterParts)
+	}
+	if autoReviewer.Role != "reviewer" || autoReviewer.ApplicationKind != "review" || !autoReviewer.Verified {
+		t.Fatalf("auto-synced reviewer mismatch: %+v", autoReviewer)
+	}
+	if autoReviewer.EvidenceURL != fixture.reviewURL(7301) || autoReviewer.GitHubLogin != "reviewer-one" {
+		t.Fatalf("auto-synced reviewer evidence mismatch: %+v", autoReviewer)
+	}
+
+	mergeGate := doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/collab/merge-gate?collab_id="+upgrade.CollabID, nil)
+	if mergeGate.Code != http.StatusOK {
+		t.Fatalf("merge gate status=%d body=%s", mergeGate.Code, mergeGate.Body.String())
+	}
+	var mergeGateResp struct {
+		ValidReviewersAtHead int `json:"valid_reviewers_at_head"`
+		ApprovalsAtHead      int `json:"approvals_at_head"`
+		ReviewComplete       bool `json:"review_complete"`
+		Mergeable            bool `json:"mergeable"`
+	}
+	if err := json.Unmarshal(mergeGate.Body.Bytes(), &mergeGateResp); err != nil {
+		t.Fatalf("decode merge gate response: %v", err)
+	}
+	if mergeGateResp.ValidReviewersAtHead != 1 || mergeGateResp.ApprovalsAtHead != 1 {
+		t.Fatalf("merge gate should count the auto-synced review, got=%+v", mergeGateResp)
+	}
+	if mergeGateResp.ReviewComplete || mergeGateResp.Mergeable {
+		t.Fatalf("one reviewer should not satisfy the default gate, got=%+v", mergeGateResp)
+	}
+}
+
 func TestCollabUpgradePRMergeGateUsesGitHubReviewsAndStaleHeads(t *testing.T) {
 	srv := newTestServer()
 	author := newAuthUser(t, srv)
